@@ -1,0 +1,10 @@
+# Exclude artifacts, tooling, and test output — keep all Go source + module files.
+bin/
+testbin/
+dist/
+cover.out
+*.log
+.git/
+.github/
+tests/e2e/
+**/*_test.go

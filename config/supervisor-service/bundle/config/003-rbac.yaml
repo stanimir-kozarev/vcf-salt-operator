@@ -1,0 +1,102 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-manager
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vcf-salt-operator-manager
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: controller
+rules:
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["salt.vcf.io"]
+  resources: ["saltkeyconfigs"]
+  verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+- apiGroups: ["salt.vcf.io"]
+  resources: ["saltkeyconfigs/finalizers"]
+  verbs: ["update"]
+- apiGroups: ["salt.vcf.io"]
+  resources: ["saltkeyconfigs/status"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: ["vmoperator.vmware.com"]
+  resources: ["virtualmachines"]
+  verbs: ["get", "list", "patch", "watch"]
+- apiGroups: ["vmoperator.vmware.com"]
+  resources: ["virtualmachines/status"]
+  verbs: ["get"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vcf-salt-operator-manager
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vcf-salt-operator-manager
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: #@ data.values.namespace
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vcf-salt-scavenger
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: scavenger
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vcf-salt-operator-scavenger
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: scavenger
+rules:
+- apiGroups: ["salt.vcf.io"]
+  resources: ["saltkeyconfigs"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+- apiGroups: ["vmoperator.vmware.com"]
+  resources: ["virtualmachines"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vcf-salt-operator-scavenger
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: scavenger
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vcf-salt-operator-scavenger
+subjects:
+- kind: ServiceAccount
+  name: vcf-salt-scavenger
+  namespace: #@ data.values.namespace

@@ -1,0 +1,22 @@
+#@data/values
+---
+namespace: vcf-salt-operator-system
+
+image:
+  repository: ghcr.io/stanimir-kozarev/vcf-salt-operator
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    cpu: "500m"
+    memory: "128Mi"
+  requests:
+    cpu: "10m"
+    memory: "64Mi"
+
+imagePullSecret:
+  dockerconfigjson: ""
+
+raas:
+  defaultInsecureSkipVerify: false

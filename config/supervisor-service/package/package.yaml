@@ -1,0 +1,99 @@
+---
+# Versioned Package. `metadata.name` MUST be "<refName>.<version>".
+# The imgpkgBundle image reference is rewritten to an immutable digest by
+# `make supervisor-service-yaml` at release time.
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: Package
+metadata:
+  name: vcf-salt-operator.salt.vcf.io.0.1.0
+  namespace: tkg-system
+spec:
+  refName: vcf-salt-operator.salt.vcf.io
+  version: 0.1.0
+  releaseNotes: |
+    Initial release of the Salt Keys Operator as a VCF9 Supervisor Service.
+    - SaltKeyConfig CRD (Namespaced) for per-namespace enrollment
+    - VirtualMachine controller: accept/delete Salt keys via VCF Salt RaaS API
+    - Scavenger CronJob for stale key cleanup
+  valuesSchema:
+    openAPIv3:
+      title: vcf-salt-operator.salt.vcf.io values schema
+      type: object
+      additionalProperties: false
+      properties:
+        namespace:
+          type: string
+          default: vcf-salt-operator-system
+          description: Namespace where the operator and scavenger are deployed.
+        image:
+          type: object
+          description: Operator container image settings.
+          properties:
+            repository:
+              type: string
+              default: ghcr.io/stanimir-kozarev/vcf-salt-operator
+            tag:
+              type: string
+              default: "0.1.0"
+            pullPolicy:
+              type: string
+              default: IfNotPresent
+              enum: ["Always", "IfNotPresent", "Never"]
+        resources:
+          type: object
+          properties:
+            limits:
+              type: object
+              properties:
+                cpu:
+                  type: string
+                  default: "500m"
+                memory:
+                  type: string
+                  default: "128Mi"
+            requests:
+              type: object
+              properties:
+                cpu:
+                  type: string
+                  default: "10m"
+                memory:
+                  type: string
+                  default: "64Mi"
+        imagePullSecret:
+          type: object
+          description: |
+            Optional registry credentials. If dockerconfigjson is set, a Secret
+            is created and wired to the operator and scavenger pods.
+          properties:
+            dockerconfigjson:
+              type: string
+              default: ""
+              description: Base64-encoded contents of a .dockerconfigjson file.
+        raas:
+          type: object
+          description: VCF Salt (RaaS) client defaults.
+          properties:
+            defaultInsecureSkipVerify:
+              type: boolean
+              default: false
+              description: |
+                If true, SaltKeyConfig instances default to skipping TLS
+                verification against the RaaS endpoint. Per-SaltKeyConfig
+                settings still override this.
+  template:
+    spec:
+      fetch:
+      - imgpkgBundle:
+          # Rewritten to an immutable digest by `make supervisor-service-yaml`.
+          image: ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.1.0
+      template:
+      - ytt:
+          paths:
+          - config/
+      - kbld:
+          paths:
+          - "-"
+          - .imgpkg/images.yml
+      deploy:
+      - kapp: {}

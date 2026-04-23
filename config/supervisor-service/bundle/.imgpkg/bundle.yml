@@ -1,0 +1,9 @@
+---
+apiVersion: imgpkg.carvel.dev/v1alpha1
+kind: Bundle
+metadata:
+  name: vcf-salt-operator-bundle
+authors:
+- name: stanimir-kozarev
+websites:
+- url: https://github.com/stanimir-kozarev/vcf-salt-operator

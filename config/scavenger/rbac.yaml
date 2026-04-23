@@ -1,0 +1,50 @@
+---
+# ClusterRole for the scavenger CronJob.
+# Needs cluster-wide read access to SaltKeyConfigs and namespace-scoped access
+# to Secrets and VirtualMachines.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: salt-keys-scavenger
+rules:
+- apiGroups:
+  - salt.vcf.io
+  resources:
+  - saltkeyconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+- apiGroups:
+  - vmoperator.vmware.com
+  resources:
+  - virtualmachines
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: salt-keys-scavenger
+  namespace: salt-keys-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: salt-keys-scavenger
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: salt-keys-scavenger
+subjects:
+- kind: ServiceAccount
+  name: salt-keys-scavenger
+  namespace: salt-keys-system

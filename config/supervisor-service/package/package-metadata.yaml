@@ -1,0 +1,24 @@
+---
+# Supervisor Service identity. `metadata.name` is the service ID validated by
+# vCenter (and, on pre-VCF9 installs, the supervisor-services-allow-list.txt).
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: PackageMetadata
+metadata:
+  name: vcf-salt-operator.salt.vcf.io
+  namespace: tkg-system
+spec:
+  displayName: "Salt Keys Operator"
+  shortDescription: "Salt minion key lifecycle manager for VCF9 Supervisor"
+  longDescription: |
+    Kubernetes operator that manages SaltStack minion key lifecycle for
+    VirtualMachines deployed in VMware Cloud Foundation 9 Supervisor
+    namespaces. Watches vmoperator.vmware.com/v1alpha4 VirtualMachine resources
+    and automatically accepts/deletes Salt minion keys via the VCF Salt (RaaS)
+    API when VMs are created or deleted. A companion CronJob scavenges stale
+    keys for VMs that no longer exist.
+  categories:
+  - saltstack
+  - vcf
+  - vmware
+  maintainers:
+  - name: stanimir-kozarev

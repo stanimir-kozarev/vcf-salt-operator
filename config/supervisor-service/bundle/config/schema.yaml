@@ -1,0 +1,30 @@
+#@data/values-schema
+---
+#@schema/desc "Namespace where the operator and scavenger are deployed."
+namespace: vcf-salt-operator-system
+
+#@schema/desc "Operator container image settings."
+image:
+  repository: ghcr.io/stanimir-kozarev/vcf-salt-operator
+  tag: "0.1.0"
+  #@schema/validation one_of=["Always", "IfNotPresent", "Never"]
+  pullPolicy: IfNotPresent
+
+#@schema/desc "Controller resource requests and limits."
+resources:
+  limits:
+    cpu: "500m"
+    memory: "128Mi"
+  requests:
+    cpu: "10m"
+    memory: "64Mi"
+
+#@schema/desc "Optional registry credentials for pulling operator/scavenger images."
+imagePullSecret:
+  #@schema/desc "Base64-encoded contents of a .dockerconfigjson file. Empty = no imagePullSecret."
+  dockerconfigjson: ""
+
+#@schema/desc "VCF Salt (RaaS) client defaults."
+raas:
+  #@schema/desc "Default TLS verification mode for SaltKeyConfigs. Individual CRs can override."
+  defaultInsecureSkipVerify: false

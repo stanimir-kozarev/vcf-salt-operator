@@ -1,0 +1,36 @@
+#@data/values
+---
+# Paste this into the "YAML Service Config" field when installing the
+# Salt Keys Operator Supervisor Service on a Supervisor.
+# All fields are optional; defaults from the bundle's schema apply if omitted.
+
+# Namespace where the operator and scavenger run on the Supervisor.
+namespace: vcf-salt-operator-system
+
+# Pin a specific operator image. If you relocate images to a private registry,
+# update `repository` accordingly and populate `imagePullSecret` below.
+image:
+  repository: ghcr.io/stanimir-kozarev/vcf-salt-operator
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Controller resources. The defaults are conservative and fit a small lab.
+resources:
+  limits:
+    cpu: "500m"
+    memory: "128Mi"
+  requests:
+    cpu: "10m"
+    memory: "64Mi"
+
+# Registry credentials.
+# Populate with the base64-encoded contents of your .dockerconfigjson file:
+#   cat ~/.docker/config.json | base64
+# Leave empty when pulling from a public registry.
+imagePullSecret:
+  dockerconfigjson: ""
+
+# VCF Salt (RaaS) defaults applied to new SaltKeyConfig instances that do not
+# set `insecureSkipVerify` explicitly. Leave false in production.
+raas:
+  defaultInsecureSkipVerify: false

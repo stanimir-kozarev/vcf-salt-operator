@@ -1,0 +1,8 @@
+# This directory is NOT a kustomize overlay. It is the source for the VCF9
+# Supervisor Service (a Carvel `Package` + imgpkg bundle, rendered with ytt +
+# kbld, not kustomize). See README.md and the `supervisor-*` Makefile targets.
+#
+# An empty kustomization file is committed to prevent accidental
+# `kustomize build config/supervisor-service` from silently succeeding with
+# an empty output in CI pipelines that enumerate kustomization roots.
+resources: []

@@ -1,0 +1,41 @@
+---
+# CronJob that runs the scavenger daily to clean up stale accepted Salt keys.
+# The scavenger deletes keys for VMs that no longer exist in any enrolled namespace.
+# Adjust schedule and image tag before deploying.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vcf-salt-scavenger
+  namespace: vcf-salt-operator-system
+spec:
+  # Run daily at 02:00 UTC. Adjust to match your maintenance window.
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: vcf-salt-scavenger
+          restartPolicy: OnFailure
+          containers:
+          - name: scavenger
+            image: ghcr.io/stanimir-kozarev/vcf-salt-operator:latest  # replace with pinned tag
+            command: ["/scavenger"]
+            args:
+            # Remove --dry-run to enable actual key deletion
+            - "--dry-run"
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              capabilities:
+                drop: ["ALL"]

@@ -1,0 +1,32 @@
+---
+# Apply this to each Supervisor namespace you want to enroll.
+# Grants the operator's ServiceAccount read access to Secrets in THIS namespace only.
+#
+# Usage:
+#   NAMESPACE=my-supervisor-ns
+#   sed "s/TARGET_NAMESPACE/$NAMESPACE/g" config/vcf9/namespace-enroll.yaml | kubectl apply -f -
+#
+# Then create the SaltKeyConfig + Secret in the same namespace (see config/samples/).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vcf-salt-operator-secret-reader
+  namespace: TARGET_NAMESPACE
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vcf-salt-operator-secret-reader
+  namespace: TARGET_NAMESPACE
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vcf-salt-operator-secret-reader
+subjects:
+- kind: ServiceAccount
+  name: vcf-salt-operator-controller-manager
+  namespace: vcf-salt-operator-system

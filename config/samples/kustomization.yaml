@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- salt_raas_secret.yaml
+- salt_v1alpha1_saltkeyconfig.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

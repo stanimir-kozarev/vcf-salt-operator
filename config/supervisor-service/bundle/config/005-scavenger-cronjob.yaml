@@ -1,0 +1,54 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: vcf-salt-scavenger
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: scavenger
+spec:
+  #! Daily at 02:00 UTC. Adjust to match your maintenance window.
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: vcf-salt-scavenger
+          restartPolicy: OnFailure
+          #@ if data.values.imagePullSecret.dockerconfigjson != "":
+          imagePullSecrets:
+          - name: registry-credentials
+          #@ end
+          volumes:
+          #! Writable /tmp required by the VCF9 spherelet-spagent sidecar (glog).
+          - name: tmp
+            emptyDir: {}
+          containers:
+          - name: scavenger
+            image: #@ "{}:{}".format(data.values.image.repository, data.values.image.tag)
+            imagePullPolicy: #@ data.values.image.pullPolicy
+            command: ["/scavenger"]
+            args:
+            #! Remove --dry-run after validating behaviour in your environment.
+            - "--dry-run"
+            volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              runAsNonRoot: true
+              capabilities:
+                drop: ["ALL"]

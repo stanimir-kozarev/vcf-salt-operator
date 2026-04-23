@@ -1,0 +1,40 @@
+## Minimal overlay for VCF9 Supervisor deployment.
+## Inherits CRD + RBAC + manager from config/default but strips optional components:
+##   - no metrics HTTPS service (no cert-manager dependency)
+##   - no Prometheus ServiceMonitor
+##   - no NetworkPolicy
+##   - no Webhook
+##
+## Build the install bundle:
+##   make build-installer IMG=<registry>/vcf-salt-operator:<tag> KUSTOMIZE_ROOT=config/vcf9
+## Apply:
+##   kubectl apply -f dist/install.yaml
+
+namespace: vcf-salt-operator-system
+namePrefix: vcf-salt-operator-
+
+resources:
+- ../crd
+- ../rbac
+- ../manager
+- imagepullsecret.yaml      # Registry credentials (populate before applying)
+
+patches:
+# Disable metrics endpoint — no cert-manager or TLS required in the Supervisor cluster.
+- patch: |-
+    - op: add
+      path: /spec/template/spec/containers/0/args/0
+      value: --metrics-bind-address=0
+  target:
+    kind: Deployment
+    name: controller-manager
+
+# Wire the imagePullSecret so the Supervisor nodes can pull from the container registry.
+- patch: |-
+    - op: add
+      path: /spec/template/spec/imagePullSecrets
+      value:
+        - name: registry-credentials
+  target:
+    kind: Deployment
+    name: controller-manager

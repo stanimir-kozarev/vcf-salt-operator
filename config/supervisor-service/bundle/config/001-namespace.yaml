@@ -1,0 +1,25 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/managed-by: supervisor-service
+    control-plane: controller-manager
+
+#@ if data.values.imagePullSecret.dockerconfigjson != "":
+---
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/dockerconfigjson
+metadata:
+  name: registry-credentials
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/managed-by: supervisor-service
+data:
+  .dockerconfigjson: #@ data.values.imagePullSecret.dockerconfigjson
+#@ end

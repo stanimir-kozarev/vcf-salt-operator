@@ -1,0 +1,38 @@
+---
+# Example SaltKeyConfig for a Supervisor namespace.
+# Create one of these per namespace to enroll it for Salt key management.
+# The operator watches VirtualMachine resources in this namespace and accepts/deletes
+# their Salt minion keys via the VCF Salt (RaaS) API.
+apiVersion: salt.vcf.io/v1alpha1
+kind: SaltKeyConfig
+metadata:
+  name: salt-config
+  namespace: my-supervisor-namespace
+spec:
+  # Base URL of the VCF Salt RaaS API endpoint.
+  raasURL: "https://aria-config.corp.example.com:443"
+
+  # Name of the Secret in this namespace holding RaaS credentials.
+  # The Secret must have keys: username, password
+  credentialsSecret: salt-raas-creds
+
+  # Salt master identifier as registered in VCF Salt.
+  # Found by running: master.get_master_presence via the RaaS API.
+  # Example value from a default VCF Salt install:
+  masterID: "saltstack_enterprise_installer"
+
+  # Maximum time to wait for a VM's Salt minion key to appear in the pending list.
+  # After this duration, the VM is annotated salt.vcf.io/key-status=Failed.
+  acceptTimeout: "10m"
+
+  # How often to re-check for a pending key while waiting.
+  requeueInterval: "30s"
+
+  # Set to true if the RaaS endpoint uses a self-signed certificate.
+  skipTLSVerify: false
+
+  # Optional: restrict which VMs in this namespace are managed.
+  # If omitted, all VMs with annotation salt.vcf.io/managed=true are managed.
+  # vmSelector:
+  #   matchLabels:
+  #     environment: production

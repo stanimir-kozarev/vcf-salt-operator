@@ -1,0 +1,81 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: #@ data.values.namespace
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: vcf-salt-operator
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: vcf-salt-operator
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: vcf-salt-operator
+    spec:
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      #@ if data.values.imagePullSecret.dockerconfigjson != "":
+      imagePullSecrets:
+      - name: registry-credentials
+      #@ end
+      volumes:
+      #! VCF9 injects a spherelet-spagent sidecar that writes glog files under
+      #! /tmp. We keep the root filesystem read-only and expose /tmp as tmpfs
+      #! so the sidecar (and any transient files) can write without privileges.
+      - name: tmp
+        emptyDir: {}
+      containers:
+      - name: manager
+        image: #@ "{}:{}".format(data.values.image.repository, data.values.image.tag)
+        imagePullPolicy: #@ data.values.image.pullPolicy
+        command: ["/manager"]
+        args:
+        - --leader-elect
+        - --health-probe-bind-address=:8081
+        #! Metrics endpoint disabled on the Supervisor (no cert-manager).
+        - --metrics-bind-address=0
+        env:
+        - name: RAAS_DEFAULT_INSECURE_SKIP_VERIFY
+          value: #@ "{}".format(data.values.raas.defaultInsecureSkipVerify).lower()
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: #@ data.values.resources.limits.cpu
+            memory: #@ data.values.resources.limits.memory
+          requests:
+            cpu: #@ data.values.resources.requests.cpu
+            memory: #@ data.values.resources.requests.memory
