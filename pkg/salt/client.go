@@ -10,12 +10,60 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 )
+
+// JIDResult holds the result of a Salt job execution for a single minion.
+// Return is kept as raw JSON because the shape differs per function:
+// test.ping / refresh_pillar return a bool; state.highstate returns a state map.
+type JIDResult struct {
+	MinionID string
+	JID      string
+	Fun      string
+	Return   json.RawMessage
+	Retcode  int
+	Success  bool
+}
+
+// BoolReturn extracts the return value as a boolean (for test.ping, refresh_pillar).
+// Returns (false, false) if the return value is not a boolean.
+func (r *JIDResult) BoolReturn() (bool, bool) {
+	var b bool
+	if err := json.Unmarshal(r.Return, &b); err != nil {
+		return false, false
+	}
+	return b, true
+}
+
+// HighstateOK returns true when state.highstate completed with no failed states.
+func (r *JIDResult) HighstateOK() bool {
+	return r.Success && r.Retcode == 0
+}
+
+// FailedStateIDs returns a sorted list of state IDs whose result was false in a
+// state.highstate return map. Returns nil if the return is not a state map or all
+// states succeeded. Only the map keys (state IDs) are inspected — no values are read.
+func (r *JIDResult) FailedStateIDs() []string {
+	var states map[string]struct {
+		Result bool `json:"result"`
+	}
+	if err := json.Unmarshal(r.Return, &states); err != nil {
+		return nil
+	}
+	var failed []string
+	for id, s := range states {
+		if !s.Result {
+			failed = append(failed, id)
+		}
+	}
+	sort.Strings(failed)
+	return failed
+}
 
 // Client is the interface for Salt key management operations.
 // Implemented by RaaSClient; can be mocked in operator tests.
@@ -25,6 +73,16 @@ type Client interface {
 	ListAcceptedKeys(ctx context.Context) ([]string, error)
 	AcceptKey(ctx context.Context, minionID string) error
 	DeleteKey(ctx context.Context, minionID string) error
+	// TestPing dispatches test.ping and waits for the result (context controls timeout).
+	TestPing(ctx context.Context, minionID string) (bool, error)
+	// RefreshPillar dispatches saltutil.refresh_pillar and waits for the result.
+	RefreshPillar(ctx context.Context, minionID string) (bool, error)
+	// DispatchHighstate dispatches state.highstate asynchronously and returns the JID.
+	// The caller should store the JID and poll with PollJID.
+	DispatchHighstate(ctx context.Context, minionID string) (string, error)
+	// PollJID checks whether a dispatched job has returned a result for the given minion.
+	// Returns (result, true, nil) when done; (nil, false, nil) when still running.
+	PollJID(ctx context.Context, minionID, jid string) (*JIDResult, bool, error)
 }
 
 // RaaSClient implements Client against the VCF Salt RaaS HTTP API.
@@ -183,6 +241,225 @@ func (c *RaaSClient) AcceptKey(ctx context.Context, minionID string) error {
 	}
 	c.log.V(1).Info("accept response", "minionID", minionID, "body", string(respBody))
 	return nil
+}
+
+// Call sends a raw /rpc call and returns the unparsed response body.
+// Intended for CLI exploration tools; not used by the operator itself.
+func (c *RaaSClient) Call(ctx context.Context, resource, method string, kwarg map[string]any) ([]byte, error) {
+	body, status, err := c.rawPost(ctx, map[string]any{
+		"resource": resource,
+		"method":   method,
+		"kwarg":    kwarg,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("HTTP %d: %s", status, body)
+	}
+	return body, nil
+}
+
+// TestPing dispatches test.ping to minionID and waits for the boolean result.
+// The context deadline controls the maximum wait time.
+func (c *RaaSClient) TestPing(ctx context.Context, minionID string) (bool, error) {
+	jid, err := c.dispatch(ctx, minionID, "test.ping", nil)
+	if err != nil {
+		return false, err
+	}
+	return c.waitBoolResult(ctx, minionID, jid, "test.ping")
+}
+
+// RefreshPillar dispatches saltutil.refresh_pillar to minionID and waits for the result.
+func (c *RaaSClient) RefreshPillar(ctx context.Context, minionID string) (bool, error) {
+	jid, err := c.dispatch(ctx, minionID, "saltutil.refresh_pillar", nil)
+	if err != nil {
+		return false, err
+	}
+	return c.waitBoolResult(ctx, minionID, jid, "saltutil.refresh_pillar")
+}
+
+// DispatchHighstate dispatches state.highstate asynchronously and returns the JID.
+// Store the JID in an annotation and poll with PollJID on subsequent reconciles.
+func (c *RaaSClient) DispatchHighstate(ctx context.Context, minionID string) (string, error) {
+	return c.dispatch(ctx, minionID, "state.highstate", nil)
+}
+
+// PollJID checks whether a dispatched job has completed for the given minion.
+// Returns (result, true, nil) when done; (nil, false, nil) when still running.
+func (c *RaaSClient) PollJID(ctx context.Context, minionID, jid string) (*JIDResult, bool, error) {
+	body, status, err := c.rawPost(ctx, map[string]any{
+		"resource": "ret",
+		"method":   "get_jid",
+		"kwarg":    map[string]any{"jid": jid},
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("poll_jid(%s): %w", jid, err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, false, fmt.Errorf("poll_jid(%s): HTTP %d: %s", jid, status, body)
+	}
+	c.log.V(1).Info("poll_jid response", "jid", jid, "minionID", minionID, "body", string(body))
+
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, false, fmt.Errorf("poll_jid(%s): parse response: %w", jid, err)
+	}
+	if errObj, ok := resp["error"]; ok && errObj != nil {
+		if m, ok := errObj.(map[string]any); ok {
+			if msg, ok := m["message"].(string); ok && msg != "" {
+				return nil, false, fmt.Errorf("poll_jid(%s): API error: %s", jid, msg)
+			}
+		}
+		return nil, false, fmt.Errorf("poll_jid(%s): API error: %v", jid, errObj)
+	}
+	ret, ok := resp["ret"].(map[string]any)
+	if !ok || len(ret) == 0 {
+		return nil, false, nil // not yet complete
+	}
+	minionData, ok := ret[minionID]
+	if !ok {
+		return nil, false, nil // this minion's result not yet available
+	}
+	minionMap, ok := minionData.(map[string]any)
+	if !ok {
+		return nil, false, fmt.Errorf("poll_jid(%s): unexpected result shape for %s", jid, minionID)
+	}
+	returnBytes, _ := json.Marshal(minionMap["return"])
+	retcode := 0
+	if rc, ok := minionMap["retcode"].(float64); ok {
+		retcode = int(rc)
+	}
+	success, _ := minionMap["success"].(bool)
+	fun, _ := minionMap["fun"].(string)
+
+	return &JIDResult{
+		MinionID: minionID,
+		JID:      jid,
+		Fun:      fun,
+		Return:   json.RawMessage(returnBytes),
+		Retcode:  retcode,
+		Success:  success,
+	}, true, nil
+}
+
+// dispatch saves a job template then routes it to a specific minion, returning the JID.
+func (c *RaaSClient) dispatch(ctx context.Context, minionID, fun string, kwarg map[string]any) (string, error) {
+	if kwarg == nil {
+		kwarg = map[string]any{}
+	}
+	name := "op-" + strings.NewReplacer(".", "-", "_", "-").Replace(fun)
+	jobUUID, err := c.saveJob(ctx, name, fun, kwarg)
+	if err != nil {
+		return "", err
+	}
+	c.log.V(1).Info("saved job", "fun", fun, "jobUUID", jobUUID)
+	jid, err := c.routeCmd(ctx, jobUUID, minionID)
+	if err != nil {
+		return "", err
+	}
+	c.log.V(1).Info("dispatched job", "fun", fun, "minionID", minionID, "jid", jid)
+	return jid, nil
+}
+
+// saveJob creates a job template in RaaS and returns its UUID.
+// NOTE: masters must NOT be set for cmd=local (only valid for runner/wheel).
+func (c *RaaSClient) saveJob(ctx context.Context, name, fun string, kwarg map[string]any) (string, error) {
+	body, status, err := c.rawPost(ctx, map[string]any{
+		"resource": "job",
+		"method":   "save_job",
+		"kwarg": map[string]any{
+			"name": name,
+			"cmd":  "local",
+			"fun":  fun,
+			"arg":  map[string]any{"arg": []any{}, "kwarg": kwarg},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("save_job(%s): %w", fun, err)
+	}
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("save_job(%s): HTTP %d: %s", fun, status, body)
+	}
+	var resp struct {
+		Ret   string         `json:"ret"`
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("save_job(%s): parse response: %w", fun, err)
+	}
+	if resp.Error != nil {
+		if msg, ok := resp.Error["message"].(string); ok && msg != "" {
+			return "", fmt.Errorf("save_job(%s): API error: %s", fun, msg)
+		}
+		return "", fmt.Errorf("save_job(%s): API error: %v", fun, resp.Error)
+	}
+	if resp.Ret == "" {
+		return "", fmt.Errorf("save_job(%s): empty job UUID in response: %s", fun, body)
+	}
+	return resp.Ret, nil
+}
+
+// routeCmd dispatches a saved job to a specific minion and returns the JID.
+func (c *RaaSClient) routeCmd(ctx context.Context, jobUUID, minionID string) (string, error) {
+	body, status, err := c.rawPost(ctx, map[string]any{
+		"resource": "cmd",
+		"method":   "route_cmd",
+		"kwarg": map[string]any{
+			"job_uuid": jobUUID,
+			"tgt": map[string]any{
+				"salt": map[string]any{
+					"tgt":      "L@" + minionID,
+					"tgt_type": "compound",
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("route_cmd(%s): %w", minionID, err)
+	}
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("route_cmd(%s): HTTP %d: %s", minionID, status, body)
+	}
+	var resp struct {
+		Ret   string         `json:"ret"`
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("route_cmd(%s): parse response: %w", minionID, err)
+	}
+	if resp.Error != nil {
+		if msg, ok := resp.Error["message"].(string); ok && msg != "" {
+			return "", fmt.Errorf("route_cmd(%s): API error: %s", minionID, msg)
+		}
+		return "", fmt.Errorf("route_cmd(%s): API error: %v", minionID, resp.Error)
+	}
+	if resp.Ret == "" {
+		return "", fmt.Errorf("route_cmd(%s): empty JID in response: %s", minionID, body)
+	}
+	return resp.Ret, nil
+}
+
+// waitBoolResult polls PollJID every 5s until the boolean result is available or ctx expires.
+func (c *RaaSClient) waitBoolResult(ctx context.Context, minionID, jid, fun string) (bool, error) {
+	for {
+		result, done, err := c.PollJID(ctx, minionID, jid)
+		if err != nil {
+			return false, err
+		}
+		if done {
+			b, ok := result.BoolReturn()
+			if !ok {
+				return false, fmt.Errorf("%s: unexpected non-boolean return for %s (raw: %s)", fun, minionID, result.Return)
+			}
+			return b, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("%s: timed out waiting for result (jid=%s): %w", fun, jid, ctx.Err())
+		case <-time.After(5 * time.Second):
+		}
+	}
 }
 
 // DeleteKey deletes (revokes) a Salt minion key by minion ID.

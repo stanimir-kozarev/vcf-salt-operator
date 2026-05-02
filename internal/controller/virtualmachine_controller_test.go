@@ -63,6 +63,25 @@ func (m *mockSaltClient) DeleteKey(_ context.Context, id string) error {
 	return m.DeleteErr
 }
 
+func (m *mockSaltClient) TestPing(_ context.Context, _ string) (bool, error) { return true, nil }
+
+func (m *mockSaltClient) RefreshPillar(_ context.Context, _ string) (bool, error) { return true, nil }
+
+func (m *mockSaltClient) DispatchHighstate(_ context.Context, _ string) (string, error) {
+	return "mock-jid-00000000000000", nil
+}
+
+func (m *mockSaltClient) PollJID(_ context.Context, minionID, jid string) (*salt.JIDResult, bool, error) {
+	return &salt.JIDResult{
+		MinionID: minionID,
+		JID:      jid,
+		Fun:      "state.highstate",
+		Return:   []byte(`{}`),
+		Retcode:  0,
+		Success:  true,
+	}, true, nil
+}
+
 // newTestReconciler creates a VirtualMachineReconciler wired to the mock Salt client and envtest k8sClient.
 func newTestReconciler(mock *mockSaltClient) *VirtualMachineReconciler {
 	return &VirtualMachineReconciler{

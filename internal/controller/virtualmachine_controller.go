@@ -8,8 +8,12 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,14 +40,27 @@ import (
 // runs before the object is removed from the API server.
 const saltFinalizer = "salt.vcf.io/cleanup"
 
-// Salt key management annotation keys written by this operator onto VirtualMachine resources.
+// postAcceptStepTimeout is the context deadline for blocking Salt operations (ping, pillar refresh).
+const postAcceptStepTimeout = 2 * time.Minute
+
+// postAcceptDelay is the grace period after key acceptance before the first test.ping.
+// Gives the salt-minion time to re-establish its ZeroMQ connection to the master
+// before the operator dispatches commands.
+const postAcceptDelay = 30 * time.Second
+
+// maxBootstrapDuration caps the total window in which transient ping/pillar-refresh
+// failures are retried automatically. After this window expires, the failure is
+// terminal and requires operator intervention.
+const maxBootstrapDuration = 10 * time.Minute
+
+// Salt annotation keys written by this operator onto VirtualMachine resources.
 const (
 	// AnnotationManaged opts a VirtualMachine into Salt key management.
 	// Namespace owner sets this to "true" on the VM spec.
 	AnnotationManaged = "salt.vcf.io/managed"
 
-	// AnnotationKeyStatus is the lifecycle state written by the operator.
-	// Values: Pending | Accepted | Failed | Deleted | DeleteFailed
+	// AnnotationKeyStatus is the key-acceptance lifecycle state.
+	// Values: Accepted | Failed | Deleted | DeleteFailed
 	AnnotationKeyStatus = "salt.vcf.io/key-status"
 
 	// AnnotationMinionID records which Salt minion ID was matched and accepted.
@@ -51,6 +68,45 @@ const (
 
 	// AnnotationMatchMethod records which matching strategy was used.
 	AnnotationMatchMethod = "salt.vcf.io/match-method"
+
+	// AnnotationSaltStatus is the post-accept Salt management phase.
+	// Values: Pinged | PillarRefreshed | HighstateDispatched | Ready | Failed/<step>
+	AnnotationSaltStatus = "salt.vcf.io/salt-status"
+
+	// AnnotationReady reflects whether Salt management is complete and successful.
+	// Values: "true" | "false"
+	AnnotationReady = "salt.vcf.io/ready"
+
+	// AnnotationHighstateJID is the JID of the currently running (or last completed) highstate.
+	AnnotationHighstateJID = "salt.vcf.io/highstate-jid"
+
+	// AnnotationHighstateStatus is the outcome of the last highstate execution.
+	// Values: InProgress | Success | Failed
+	AnnotationHighstateStatus = "salt.vcf.io/highstate-status"
+
+	// AnnotationHighstateTime is the RFC3339 timestamp of the last highstate completion.
+	AnnotationHighstateTime = "salt.vcf.io/highstate-time"
+
+	// AnnotationRoles is the roles list set by Argo CD (observed, never written by the operator).
+	// The operator watches this annotation for Day-2 change detection.
+	AnnotationRoles = "salt.vcf.io/roles"
+
+	// AnnotationRolesHash is the SHA256 hash of AnnotationRoles at the time of last highstate dispatch.
+	// A mismatch triggers a Day-2 refresh_pillar + highstate cycle.
+	AnnotationRolesHash = "salt.vcf.io/roles-hash"
+
+	// AnnotationAcceptedAt is the RFC3339 timestamp when the Salt key was accepted.
+	// Used to enforce postAcceptDelay before the first test.ping and to bound the
+	// total retry window (maxBootstrapDuration) for transient ping/pillar failures.
+	AnnotationAcceptedAt = "salt.vcf.io/accepted-at"
+
+	// AnnotationHighstateFailedCount is the number of failed states in the last highstate.
+	// "0" means all states succeeded. Safe to expose to app teams (no secret values).
+	AnnotationHighstateFailedCount = "salt.vcf.io/highstate-failed-count"
+
+	// AnnotationHighstateFailedStates is a comma-separated list of failed state IDs from
+	// the last highstate run. Contains only state map keys, never rendered values or secrets.
+	AnnotationHighstateFailedStates = "salt.vcf.io/highstate-failed-states"
 )
 
 // virtualMachineGVK is the GroupVersionKind for the VM Service VirtualMachine resource.
@@ -170,67 +226,77 @@ func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return r.reconcileCreate(ctx, vm, saltConfig)
 }
 
-// reconcileCreate implements Phase 5: accept the Salt minion key when the VM reaches Running.
-// It is idempotent — already-accepted VMs are skipped immediately.
+// reconcileCreate handles the VM create/update path. Phase 1 accepts the Salt minion key;
+// Phases 2–5 run the post-accept bootstrap chain (ping → refresh_pillar → highstate)
+// and subsequently watch for Day-2 role changes.
 func (r *VirtualMachineReconciler) reconcileCreate(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
 	cfg *saltv1alpha1.SaltKeyConfig,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-
-	// Idempotency: already accepted — ensure finalizer is still present.
-	// The finalizer may be absent on VMs accepted before a prior operator version
-	// that lacked finalizer support (upgrade safety).
-	if vm.GetAnnotations()[AnnotationKeyStatus] == "Accepted" {
-		if !controllerutil.ContainsFinalizer(vm, saltFinalizer) {
-			fp := client.MergeFrom(vm.DeepCopy())
-			controllerutil.AddFinalizer(vm, saltFinalizer)
-			if err := r.Patch(ctx, vm, fp); err != nil {
-				return ctrl.Result{}, fmt.Errorf("re-add finalizer to %s: %w", vm.GetName(), err)
-			}
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// Parse config intervals (defaults are set in CRD but parse defensively)
-	acceptTimeout := parseDurationOrDefault(cfg.Spec.AcceptTimeout, 10*time.Minute)
 	requeueAfter := parseDurationOrDefault(cfg.Spec.RequeueInterval, 30*time.Second)
 
-	// Wait for VM to be running with an IP before checking for pending keys.
-	// v1alpha1 VMs expose status.phase; v1alpha4 VMs expose status.powerState.
-	// Either satisfies "running". We additionally require status.network.primaryIP4
-	// so the minion has had a chance to boot and contact RaaS.
-	phase, _, _ := unstructured.NestedString(vm.Object, "status", "phase")
-	powerState, _, _ := unstructured.NestedString(vm.Object, "status", "powerState")
-	primaryIP, _, _ := unstructured.NestedString(vm.Object, "status", "network", "primaryIP4")
-	running := phase == "Running" || powerState == "PoweredOn"
-	if !running || primaryIP == "" {
-		log.Info("Waiting for VM to be running with an IP",
-			"name", vm.GetName(),
-			"phase", phase, "powerState", powerState, "primaryIP", primaryIP)
-		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	// Key not yet accepted: wait for the VM to be running with an IP before polling RaaS.
+	// v1alpha1 exposes status.phase; v1alpha4 exposes status.powerState.
+	if vm.GetAnnotations()[AnnotationKeyStatus] != "Accepted" {
+		acceptTimeout := parseDurationOrDefault(cfg.Spec.AcceptTimeout, 10*time.Minute)
+		phase, _, _ := unstructured.NestedString(vm.Object, "status", "phase")
+		powerState, _, _ := unstructured.NestedString(vm.Object, "status", "powerState")
+		primaryIP, _, _ := unstructured.NestedString(vm.Object, "status", "network", "primaryIP4")
+		running := phase == "Running" || powerState == "PoweredOn"
+		if !running || primaryIP == "" {
+			log.Info("Waiting for VM to be running with an IP",
+				"name", vm.GetName(),
+				"phase", phase, "powerState", powerState, "primaryIP", primaryIP)
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+		}
+		saltClient, err := r.saltClientFromConfig(ctx, cfg)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("get salt client for %s: %w", vm.GetName(), err)
+		}
+		return r.runAcceptKey(ctx, vm, saltClient, primaryIP, acceptTimeout, requeueAfter)
 	}
 
-	// Get a logged-in RaaS client (cached per SaltKeyConfig, reused across reconciles).
+	// Key is accepted — ensure finalizer is present (upgrade-safety: may be absent on pre-finalizer VMs).
+	if !controllerutil.ContainsFinalizer(vm, saltFinalizer) {
+		fp := client.MergeFrom(vm.DeepCopy())
+		controllerutil.AddFinalizer(vm, saltFinalizer)
+		if err := r.Patch(ctx, vm, fp); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-add finalizer to %s: %w", vm.GetName(), err)
+		}
+	}
+
+	// Post-accept phases do not require the VM's IP — the minion communicates with the
+	// Salt master independently. We only need a live RaaS client.
 	saltClient, err := r.saltClientFromConfig(ctx, cfg)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("get salt client for %s: %w", vm.GetName(), err)
 	}
+	minionID := vm.GetAnnotations()[AnnotationMinionID]
+	return r.reconcilePostAccept(ctx, vm, saltClient, minionID, requeueAfter)
+}
+
+// runAcceptKey looks for a pending Salt key that matches this VM and accepts it.
+// Returns early (requeue) if no key is found yet; marks Failed after acceptTimeout.
+func (r *VirtualMachineReconciler) runAcceptKey(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	primaryIP string,
+	acceptTimeout, requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 
 	pendingKeys, err := saltClient.ListPendingKeys(ctx)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list pending keys for %s: %w", vm.GetName(), err)
 	}
 
-	// Match VM to a pending key using name, IP, shifted-IP, or prefix strategies
 	match := salt.FindMinionID(vm.GetName(), primaryIP, pendingKeys)
 	if match.Method != salt.MatchNone {
 		log.Info("Matched pending Salt key",
-			"name", vm.GetName(),
-			"minionID", match.MinionID,
-			"matchMethod", match.Method,
-		)
+			"name", vm.GetName(), "minionID", match.MinionID, "matchMethod", match.Method)
 		if err := saltClient.AcceptKey(ctx, match.MinionID); err != nil {
 			return ctrl.Result{}, fmt.Errorf("accept key %q for %s: %w", match.MinionID, vm.GetName(), err)
 		}
@@ -238,14 +304,14 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 			AnnotationKeyStatus:   "Accepted",
 			AnnotationMinionID:    match.MinionID,
 			AnnotationMatchMethod: string(match.Method),
+			AnnotationAcceptedAt:  time.Now().UTC().Format(time.RFC3339),
 		}); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Add finalizer so reconcileDelete fires when the VM is removed
 		if !controllerutil.ContainsFinalizer(vm, saltFinalizer) {
-			finalizerPatch := client.MergeFrom(vm.DeepCopy())
+			fp := client.MergeFrom(vm.DeepCopy())
 			controllerutil.AddFinalizer(vm, saltFinalizer)
-			if err := r.Patch(ctx, vm, finalizerPatch); err != nil {
+			if err := r.Patch(ctx, vm, fp); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -254,27 +320,359 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 		return ctrl.Result{}, nil
 	}
 
-	// No matching pending key yet — check timeout
 	elapsed := time.Since(vm.GetCreationTimestamp().Time)
 	if elapsed < acceptTimeout {
 		log.Info("No matching pending key yet, requeueing",
-			"name", vm.GetName(),
-			"elapsed", elapsed.Round(time.Second),
-			"timeout", acceptTimeout,
-		)
+			"name", vm.GetName(), "elapsed", elapsed.Round(time.Second), "timeout", acceptTimeout)
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
-	// Timeout exceeded — mark as Failed
-	log.Info("Accept timeout exceeded, marking as Failed", "name", vm.GetName(), "elapsed", elapsed.Round(time.Second))
-	if err := r.patchAnnotations(ctx, vm, map[string]string{
-		AnnotationKeyStatus: "Failed",
-	}); err != nil {
+	log.Info("Accept timeout exceeded, marking as Failed",
+		"name", vm.GetName(), "elapsed", elapsed.Round(time.Second))
+	if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationKeyStatus: "Failed"}); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltKeyTimeout",
 		fmt.Sprintf("No pending Salt key found for %q after %s", vm.GetName(), acceptTimeout))
 	return ctrl.Result{}, nil
+}
+
+// reconcilePostAccept drives the post-accept state machine:
+// "" → Pinged → PillarRefreshed → HighstateDispatched → Ready (then Day-2 loop).
+// Failed/<step> states are terminal — user must intervene.
+func (r *VirtualMachineReconciler) reconcilePostAccept(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	if minionID == "" {
+		logf.FromContext(ctx).Error(nil, "Accepted VM has no minion-id annotation — skipping post-accept", "name", vm.GetName())
+		return ctrl.Result{}, nil
+	}
+	switch vm.GetAnnotations()[AnnotationSaltStatus] {
+	case "":
+		// Enforce grace period: wait postAcceptDelay after key acceptance before the
+		// first ping. This gives the salt-minion time to re-establish its ZeroMQ
+		// connection — no annotation patch during the wait, so no spurious watch events.
+		if acceptedAt, err := time.Parse(time.RFC3339, vm.GetAnnotations()[AnnotationAcceptedAt]); err == nil {
+			if remaining := postAcceptDelay - time.Since(acceptedAt); remaining > 0 {
+				logf.FromContext(ctx).Info("Waiting for minion to connect after key acceptance",
+					"name", vm.GetName(), "minionID", minionID, "remaining", remaining.Round(time.Second))
+				return ctrl.Result{RequeueAfter: remaining}, nil
+			}
+		}
+		return r.runPing(ctx, vm, saltClient, minionID, requeueAfter)
+	case "Pinged":
+		return r.runRefreshPillar(ctx, vm, saltClient, minionID, requeueAfter)
+	case "PillarRefreshed":
+		return r.runDispatchHighstate(ctx, vm, saltClient, minionID, requeueAfter)
+	case "HighstateDispatched":
+		return r.runPollHighstate(ctx, vm, saltClient, minionID,
+			vm.GetAnnotations()[AnnotationHighstateJID], requeueAfter)
+	case "Ready":
+		return r.checkDay2(ctx, vm, saltClient, minionID, requeueAfter)
+	default:
+		// Failed/<step> — terminal; logged in the event that set it
+		return ctrl.Result{}, nil
+	}
+}
+
+// runPing dispatches test.ping and advances the state machine to "Pinged" on success.
+func (r *VirtualMachineReconciler) runPing(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Running test.ping", "name", vm.GetName(), "minionID", minionID)
+
+	pingCtx, cancel := context.WithTimeout(ctx, postAcceptStepTimeout)
+	defer cancel()
+
+	ok, err := saltClient.TestPing(pingCtx, minionID)
+	if err != nil || !ok {
+		msg := "test.ping returned false"
+		if err != nil {
+			msg = fmt.Sprintf("test.ping: %v", err)
+		}
+		log.Error(err, "test.ping failed", "name", vm.GetName(), "minionID", minionID)
+
+		// Retry without patching (no watch event) while within maxBootstrapDuration.
+		if acceptedAt, parseErr := time.Parse(time.RFC3339, vm.GetAnnotations()[AnnotationAcceptedAt]); parseErr == nil {
+			if time.Since(acceptedAt) < maxBootstrapDuration {
+				log.Info("test.ping transient failure — retrying in 60s",
+					"name", vm.GetName(), "minionID", minionID)
+				r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPingRetry",
+					fmt.Sprintf("test.ping failed for minion %q, retrying: %s", minionID, msg))
+				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			}
+		}
+
+		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus: "Failed/Ping",
+			AnnotationReady:      "false",
+		}); pErr != nil {
+			return ctrl.Result{}, pErr
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPingFailed", msg)
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("test.ping succeeded", "name", vm.GetName(), "minionID", minionID)
+	if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationSaltStatus: "Pinged"}); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltPingSucceeded",
+		fmt.Sprintf("test.ping succeeded for minion %q", minionID))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// runRefreshPillar dispatches saltutil.refresh_pillar and advances state to "PillarRefreshed".
+// Per the load-bearing invariant: refresh_pillar MUST precede every state.highstate.
+func (r *VirtualMachineReconciler) runRefreshPillar(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Running saltutil.refresh_pillar", "name", vm.GetName(), "minionID", minionID)
+
+	rfCtx, cancel := context.WithTimeout(ctx, postAcceptStepTimeout)
+	defer cancel()
+
+	ok, err := saltClient.RefreshPillar(rfCtx, minionID)
+	if err != nil || !ok {
+		msg := "refresh_pillar returned false"
+		if err != nil {
+			msg = fmt.Sprintf("refresh_pillar: %v", err)
+		}
+		log.Error(err, "refresh_pillar failed", "name", vm.GetName(), "minionID", minionID)
+
+		if acceptedAt, parseErr := time.Parse(time.RFC3339, vm.GetAnnotations()[AnnotationAcceptedAt]); parseErr == nil {
+			if time.Since(acceptedAt) < maxBootstrapDuration {
+				log.Info("refresh_pillar transient failure — retrying in 60s",
+					"name", vm.GetName(), "minionID", minionID)
+				r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPillarRefreshRetry",
+					fmt.Sprintf("refresh_pillar failed for minion %q, retrying: %s", minionID, msg))
+				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+			}
+		}
+
+		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus: "Failed/PillarRefresh",
+			AnnotationReady:      "false",
+		}); pErr != nil {
+			return ctrl.Result{}, pErr
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPillarRefreshFailed", msg)
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("refresh_pillar succeeded", "name", vm.GetName(), "minionID", minionID)
+	if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationSaltStatus: "PillarRefreshed"}); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltPillarRefreshed",
+		fmt.Sprintf("refresh_pillar succeeded for minion %q", minionID))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// runDispatchHighstate dispatches state.highstate asynchronously and stores the JID.
+// The next reconcile will poll the result via runPollHighstate.
+func (r *VirtualMachineReconciler) runDispatchHighstate(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Dispatching state.highstate", "name", vm.GetName(), "minionID", minionID)
+
+	dispCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	jid, err := saltClient.DispatchHighstate(dispCtx, minionID)
+	if err != nil {
+		log.Error(err, "highstate dispatch failed", "name", vm.GetName(), "minionID", minionID)
+		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus: "Failed/HighstateDispatch",
+			AnnotationReady:      "false",
+		}); pErr != nil {
+			return ctrl.Result{}, pErr
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltHighstateDispatchFailed",
+			fmt.Sprintf("highstate dispatch failed for %q: %v", minionID, err))
+		return ctrl.Result{}, nil
+	}
+
+	rolesHash := computeRolesHash(vm.GetAnnotations()[AnnotationRoles])
+	if err := r.patchAnnotations(ctx, vm, map[string]string{
+		AnnotationSaltStatus:      "HighstateDispatched",
+		AnnotationHighstateJID:    jid,
+		AnnotationHighstateStatus: "InProgress",
+		AnnotationReady:           "false",
+		AnnotationRolesHash:       rolesHash,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("Highstate dispatched", "name", vm.GetName(), "minionID", minionID, "jid", jid)
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltHighstateDispatched",
+		fmt.Sprintf("state.highstate dispatched for minion %q (JID: %s)", minionID, jid))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// runPollHighstate makes a single PollJID call and advances state when the job completes.
+// If not done it requeues; transient poll errors are retried on the next reconcile.
+func (r *VirtualMachineReconciler) runPollHighstate(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID, jid string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if jid == "" {
+		log.Error(nil, "HighstateDispatched but no JID annotation — requeueing", "name", vm.GetName())
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	result, done, err := saltClient.PollJID(ctx, minionID, jid)
+	if err != nil {
+		log.Error(err, "PollJID transient error — requeueing", "name", vm.GetName(), "jid", jid)
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+	if !done {
+		log.Info("Highstate not yet complete", "name", vm.GetName(), "jid", jid)
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	failedIDs := result.FailedStateIDs()
+	failedStates := strings.Join(failedIDs, ",")
+	failedCount := len(failedIDs)
+
+	if result.HighstateOK() {
+		log.Info("Highstate succeeded", "name", vm.GetName(), "minionID", minionID, "jid", jid)
+		if err := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus:            "Ready",
+			AnnotationReady:                 "true",
+			AnnotationHighstateStatus:       "Success",
+			AnnotationHighstateTime:         now,
+			AnnotationHighstateFailedCount:  "0",
+			AnnotationHighstateFailedStates: "",
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltHighstateSuccess",
+			fmt.Sprintf("state.highstate succeeded for minion %q (JID: %s)", minionID, jid))
+	} else {
+		log.Info("Highstate failed", "name", vm.GetName(), "minionID", minionID,
+			"jid", jid, "retcode", result.Retcode, "failedStates", failedStates)
+		if err := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus:            "Failed/Highstate",
+			AnnotationReady:                 "false",
+			AnnotationHighstateStatus:       "Failed",
+			AnnotationHighstateTime:         now,
+			AnnotationHighstateFailedCount:  strconv.Itoa(failedCount),
+			AnnotationHighstateFailedStates: failedStates,
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltHighstateFailed",
+			fmt.Sprintf("state.highstate failed for minion %q (JID: %s, retcode: %d, failed: %s)",
+				minionID, jid, result.Retcode, failedStates))
+	}
+	return ctrl.Result{}, nil
+}
+
+// checkDay2 detects role changes (via AnnotationRoles hash) and re-triggers the
+// refresh_pillar → highstate chain when Argo CD pushes a new roles list.
+func (r *VirtualMachineReconciler) checkDay2(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	annotations := vm.GetAnnotations()
+
+	rolesVal := annotations[AnnotationRoles]
+	if rolesVal == "" {
+		return ctrl.Result{}, nil // no roles managed — nothing to watch
+	}
+	currentHash := computeRolesHash(rolesVal)
+	if currentHash == annotations[AnnotationRolesHash] {
+		return ctrl.Result{}, nil // no change
+	}
+
+	log.Info("Roles annotation changed, triggering Day-2 refresh_pillar + highstate",
+		"name", vm.GetName(), "minionID", minionID)
+
+	rfCtx, rfCancel := context.WithTimeout(ctx, postAcceptStepTimeout)
+	defer rfCancel()
+	ok, err := saltClient.RefreshPillar(rfCtx, minionID)
+	if err != nil || !ok {
+		msg := "Day-2 refresh_pillar returned false"
+		if err != nil {
+			msg = fmt.Sprintf("Day-2 refresh_pillar: %v", err)
+		}
+		log.Error(err, "Day-2 refresh_pillar failed", "name", vm.GetName(), "minionID", minionID)
+		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus: "Failed/PillarRefresh",
+			AnnotationReady:      "false",
+		}); pErr != nil {
+			return ctrl.Result{}, pErr
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltDay2PillarFailed", msg)
+		return ctrl.Result{}, nil
+	}
+
+	dispCtx, dispCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer dispCancel()
+	jid, err := saltClient.DispatchHighstate(dispCtx, minionID)
+	if err != nil {
+		log.Error(err, "Day-2 highstate dispatch failed", "name", vm.GetName(), "minionID", minionID)
+		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+			AnnotationSaltStatus: "Failed/HighstateDispatch",
+			AnnotationReady:      "false",
+		}); pErr != nil {
+			return ctrl.Result{}, pErr
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltDay2HighstateFailed",
+			fmt.Sprintf("Day-2 highstate dispatch failed: %v", err))
+		return ctrl.Result{}, nil
+	}
+
+	// Record new roles hash and JID atomically — next reconcile enters runPollHighstate.
+	if err := r.patchAnnotations(ctx, vm, map[string]string{
+		AnnotationSaltStatus:      "HighstateDispatched",
+		AnnotationHighstateJID:    jid,
+		AnnotationHighstateStatus: "InProgress",
+		AnnotationReady:           "false",
+		AnnotationRolesHash:       currentHash,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("Day-2 highstate dispatched", "name", vm.GetName(), "minionID", minionID, "jid", jid)
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltDay2Dispatched",
+		fmt.Sprintf("Day-2 state.highstate dispatched for minion %q (JID: %s)", minionID, jid))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// computeRolesHash returns a short SHA-256 hex digest of the roles annotation value.
+// Used for Day-2 change detection — a mismatch with AnnotationRolesHash triggers re-dispatch.
+func computeRolesHash(roles string) string {
+	h := sha256.Sum256([]byte(roles))
+	return hex.EncodeToString(h[:8])
 }
 
 // reconcileDelete implements Phase 6: fire-and-forget key deletion on VM removal.
