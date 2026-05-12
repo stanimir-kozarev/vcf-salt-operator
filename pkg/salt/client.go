@@ -240,6 +240,10 @@ func (c *RaaSClient) AcceptKey(ctx context.Context, minionID string) error {
 		return fmt.Errorf("accept key for %q: HTTP %d: %s", minionID, statusCode, string(respBody))
 	}
 	c.log.V(1).Info("accept response", "minionID", minionID, "body", string(respBody))
+	// The RaaS API returns HTTP 200 even when the operation fails; check the body.
+	if err := checkBodyError(respBody); err != nil {
+		return fmt.Errorf("accept key for %q: %w", minionID, err)
+	}
 	return nil
 }
 
@@ -480,6 +484,10 @@ func (c *RaaSClient) DeleteKey(ctx context.Context, minionID string) error {
 		return fmt.Errorf("delete key for %q: HTTP %d: %s", minionID, statusCode, string(respBody))
 	}
 	c.log.V(1).Info("delete response", "minionID", minionID, "body", string(respBody))
+	// The RaaS API returns HTTP 200 even when the operation fails; check the body.
+	if err := checkBodyError(respBody); err != nil {
+		return fmt.Errorf("delete key for %q: %w", minionID, err)
+	}
 	return nil
 }
 
@@ -568,6 +576,26 @@ func (c *RaaSClient) doPost(ctx context.Context, fields map[string]any) ([]byte,
 		return nil, resp.StatusCode, fmt.Errorf("read response body: %w", err)
 	}
 	return respBody, resp.StatusCode, nil
+}
+
+// checkBodyError inspects a RaaS /rpc response body for {"error": {...}} payloads.
+// The RaaS API returns HTTP 200 for some failure conditions, so HTTP status alone is
+// insufficient for set_minion_key_state (accept/delete) calls.
+func checkBodyError(body []byte) error {
+	var resp map[string]any
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil // non-JSON body; HTTP status check already handled it
+	}
+	errObj, ok := resp["error"]
+	if !ok || errObj == nil {
+		return nil
+	}
+	if m, ok := errObj.(map[string]any); ok {
+		if msg, ok := m["message"].(string); ok && msg != "" {
+			return fmt.Errorf("API error: %s", msg)
+		}
+	}
+	return fmt.Errorf("API error: %v", errObj)
 }
 
 // extractMinions parses a minions.get_minion_key_state response and returns the minion IDs.

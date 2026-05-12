@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -239,6 +240,67 @@ func TestLogin_NoCookieAfterLogin(t *testing.T) {
 	client := salt.NewRaaSClient(server.URL, "admin", "password", "test-master", true, logr.Discard())
 	if err := client.Login(context.Background()); err == nil {
 		t.Fatal("expected Login to fail when server sets no _xsrf cookie, got nil")
+	}
+}
+
+// mockRaaSServerWithKeyStateError returns a server that responds to set_minion_key_state
+// with HTTP 200 but an error payload in the body — the real RaaS behaviour on failure.
+func mockRaaSServerWithKeyStateError(t *testing.T, errorMessage string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/account/login", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "_xsrf", Value: testXSRF, Path: "/"})
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"jwt": testJWT})
+	})
+	mux.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// HTTP 200 with error payload — the RaaS API behaviour on set_minion_key_state failure.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ret":   nil,
+			"error": map[string]any{"message": errorMessage},
+		})
+	})
+	return httptest.NewServer(mux)
+}
+
+func TestAcceptKey_BodyLevelError(t *testing.T) {
+	server := mockRaaSServerWithKeyStateError(t, "minion key not found in pending state")
+	defer server.Close()
+
+	client := salt.NewRaaSClient(server.URL, "admin", "password", "test-master", true, logr.Discard())
+	if err := client.Login(context.Background()); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+
+	err := client.AcceptKey(context.Background(), "nonexistent-minion")
+	if err == nil {
+		t.Fatal("expected AcceptKey to return error on body-level API error, got nil")
+	}
+	if !strings.Contains(err.Error(), "API error") {
+		t.Errorf("expected error to contain 'API error', got: %v", err)
+	}
+}
+
+func TestDeleteKey_BodyLevelError(t *testing.T) {
+	server := mockRaaSServerWithKeyStateError(t, "minion key not found")
+	defer server.Close()
+
+	client := salt.NewRaaSClient(server.URL, "admin", "password", "test-master", true, logr.Discard())
+	if err := client.Login(context.Background()); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+
+	err := client.DeleteKey(context.Background(), "nonexistent-minion")
+	if err == nil {
+		t.Fatal("expected DeleteKey to return error on body-level API error, got nil")
+	}
+	if !strings.Contains(err.Error(), "API error") {
+		t.Errorf("expected error to contain 'API error', got: %v", err)
 	}
 }
 
