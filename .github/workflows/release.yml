@@ -8,10 +8,12 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  BUNDLE_IMAGE_NAME: ${{ github.repository }}-bundle
 
 permissions:
   contents: write
   packages: write
+  id-token: write # required for keyless cosign signing (GitHub OIDC -> Sigstore Fulcio)
 
 jobs:
   test:
@@ -32,9 +34,13 @@ jobs:
           make test
 
   release:
-    name: Build image and create release
+    name: Build image, bundle, and create release
     needs: test
     runs-on: ubuntu-latest
+    env:
+      # The "secrets" context cannot be read directly inside a step's "if:" condition, so its
+      # presence is captured here as a plain env var instead.
+      HAS_ORG_SIGNING_KEY: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,6 +65,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Build and push container image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -86,8 +93,106 @@ jobs:
           cd config/manager && kustomize edit set image controller=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           cd ../.. && kustomize build config/vcf9 > dist/install-vcf9.yaml
 
+      - name: Install Carvel tools
+        run: curl -L https://carvel.dev/install.sh | sudo bash
+
+      - name: Build and push Supervisor Service bundle
+        id: bundle
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          IMG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          BUNDLE_IMG: ${{ env.REGISTRY }}/${{ env.BUNDLE_IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        run: |
+          make supervisor-bundle VERSION="$VERSION" IMG="$IMG" BUNDLE_IMG="$BUNDLE_IMG"
+          echo "digest=$(awk '/image:/{print $2; exit}' dist/supervisor-bundle.lock.yml)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Supervisor Service YAML
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: make supervisor-service-yaml VERSION="$VERSION"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Always on, no configuration needed. Keyless: a short-lived Fulcio certificate tied to
+      # this workflow's own GitHub OIDC identity, recorded in the public Rekor transparency log.
+      # This is what makes the publicly downloadable bundle/image verifiable by anyone - Harbor,
+      # Nexus, and `cosign verify` all understand it natively - but the VCF9 Supervisor does NOT
+      # trust it: Supervisor ignores the transparency log and only accepts a certificate chaining
+      # to its own built-in, non-extensible pool (a publicly trusted CA, or Broadcom's own CA for
+      # first-party services). Broadcom does not currently enforce signing at all - an unsigned
+      # bundle still installs, just with a third-party disclaimer - and may support a
+      # customer-supplied CA in a future release; see config/supervisor-service/README.md's
+      # "Signed-artifact enforcement" section.
+      - name: Sign artifacts with keyless Sigstore (Fulcio)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          cosign sign --yes "${{ steps.bundle.outputs.digest }}"
+          cosign sign-blob --yes \
+            --output-signature dist/install-vcf9.yaml.keyless.sig \
+            --output-certificate dist/install-vcf9.yaml.keyless.pem \
+            dist/install-vcf9.yaml
+          cosign sign-blob --yes \
+            --output-signature "dist/vcf-salt-operator-supervisorservice-$VERSION.yaml.keyless.sig" \
+            --output-certificate "dist/vcf-salt-operator-supervisorservice-$VERSION.yaml.keyless.pem" \
+            "dist/vcf-salt-operator-supervisorservice-$VERSION.yaml"
+
+      # Optional, off by default. Only runs if this repository's own secrets are configured -
+      # fork it and set your own to also sign with a certificate the VCF9 Supervisor itself will
+      # trust. The Supervisor requires a real cosign key-based signature (not keyless) whose
+      # certificate chains to a publicly trusted CA; see config/supervisor-service/README.md's
+      # "Signed-artifact enforcement" section for what COSIGN_CERTIFICATE/_CHAIN must satisfy.
+      # COSIGN_PRIVATE_KEY may be raw cosign key material OR a KMS reference such as
+      # azurekms://..., awskms://..., gcpkms://... - if it's a KMS reference, add whatever login
+      # step your cloud needs before this one so cosign can authenticate to it.
+      - name: Sign artifacts with organization-supplied key (optional)
+        if: ${{ env.HAS_ORG_SIGNING_KEY == 'true' }}
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_CERTIFICATE: ${{ secrets.COSIGN_CERTIFICATE }}
+          COSIGN_CERTIFICATE_CHAIN: ${{ secrets.COSIGN_CERTIFICATE_CHAIN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          case "$COSIGN_PRIVATE_KEY" in
+            -----BEGIN*)
+              KEY_REF=/tmp/cosign.key
+              printf '%s' "$COSIGN_PRIVATE_KEY" > "$KEY_REF"
+              ;;
+            *://*) KEY_REF="$COSIGN_PRIVATE_KEY" ;; # KMS reference: azurekms://, awskms://, gcpkms://, hashivault://, k8s://
+            *)
+              KEY_REF=/tmp/cosign.key
+              printf '%s' "$COSIGN_PRIVATE_KEY" > "$KEY_REF"
+              ;;
+          esac
+          printf '%s' "$COSIGN_CERTIFICATE" > /tmp/cosign.cert.pem
+          printf '%s' "$COSIGN_CERTIFICATE_CHAIN" > /tmp/cosign.chain.pem
+
+          sign() {
+            cosign sign --key "$KEY_REF" --certificate /tmp/cosign.cert.pem \
+              --certificate-chain /tmp/cosign.chain.pem --tlog-upload=false --yes "$1"
+          }
+          sign_blob() {
+            cosign sign-blob --key "$KEY_REF" --certificate /tmp/cosign.cert.pem \
+              --certificate-chain /tmp/cosign.chain.pem --tlog-upload=false --yes \
+              --output-signature "$1.orgkey.sig" --output-certificate "$1.orgkey.pem" "$1"
+          }
+
+          sign "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+          sign "${{ steps.bundle.outputs.digest }}"
+          sign_blob dist/install-vcf9.yaml
+          sign_blob "dist/vcf-salt-operator-supervisorservice-$VERSION.yaml"
+
+          rm -f /tmp/cosign.key
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/install-vcf9.yaml
+          files: |
+            dist/install-vcf9.yaml
+            dist/vcf-salt-operator-supervisorservice-*.yaml
+            dist/*.sig
+            dist/*.pem

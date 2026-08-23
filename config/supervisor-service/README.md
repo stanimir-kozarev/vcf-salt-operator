@@ -142,12 +142,71 @@ On the Supervisor:
 5. Paste `sample-values.yaml` into **YAML Service Config**, edit as needed,
    **OK**.
 
-## Signed-artifact enforcement
+## Signing
 
-VCF9 validates signatures on third‑party Supervisor Service artifacts. Sign
-the bundle with [cosign](https://docs.sigstore.dev/cosign/) before installing
-on a policy-enforced Supervisor:
+Two independent signatures can exist on the same release, for two different audiences.
+
+### Public signature (keyless, always on)
+
+Every release image and bundle is signed automatically with keyless [cosign](https://docs.sigstore.dev/cosign/)/Sigstore:
+a short-lived certificate is issued by the public Fulcio CA based on the release workflow's own
+GitHub OIDC identity, and the signature is recorded in the public Rekor transparency log. No key
+management, no cost, no configuration - this is what lets Harbor, Nexus, `cosign verify`, and any
+other Sigstore-aware consumer verify that a given image/bundle genuinely came from this repository's
+own release workflow:
 
 ```sh
-cosign sign --key <key> <registry>/vcf-salt-operator-bundle@<digest>
+cosign verify \
+    --certificate-identity-regexp 'https://github.com/stanimir-kozarev/vcf-salt-operator/.github/workflows/release.yml@.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    ghcr.io/stanimir-kozarev/vcf-salt-operator@<digest>
 ```
+
+**This is not what the VCF9 Supervisor trusts** - see the next section.
+
+### VCF9 Supervisor trust (organization key, optional)
+
+The Supervisor verifies bundle signatures with cosign plus traditional PKI, not keyless/transparency-log
+signing - it **ignores the transparency log entirely** during verification. It only accepts a
+signature whose embedded leaf certificate chains to a root in its own **built-in, non-extensible
+trust pool**: a publicly trusted CA, or Broadcom's own internal CA (first-party services only).
+Self-signed or private-CA signatures, and the keyless signature above, are both rejected outright.
+
+**Broadcom does not currently enforce this** - an unsigned bundle still installs, triggering only a
+third-party software disclaimer in the vSphere Client UI, with some high-privilege capabilities
+restricted to bundles the Supervisor can verify as trusted. Broadcom's own docs note the Supervisor
+"does not yet support extending its trust pool with custom CA," implying that may change in a future
+release - worth rechecking before assuming this section is still accurate.
+
+If your organization needs the Supervisor itself to trust this bundle today, you need your own
+code-signing certificate from a publicly trusted CA (a real, usually paid, identity-verified
+purchase - not something this project provides or can substitute a free/self-issued cert for).
+
+**Sign locally**, after `make supervisor-bundle` and `make supervisor-service-yaml`:
+
+```sh
+make supervisor-sign \
+    COSIGN_KEY=cosign.key COSIGN_CERT=cert.pem COSIGN_CHAIN=chain.pem \
+    IMG_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMG")
+```
+
+`COSIGN_KEY` may be a local key file or a [cosign KMS reference](https://docs.sigstore.dev/cosign/key-management/overview/)
+(`azurekms://...`, `awskms://...`, `gcpkms://...`, `hashivault://...`) if your certificate's
+private key lives in a cloud HSM rather than a file - the Supervisor only inspects the certificate
+and chain, not how the key itself is stored. Since June 2023, CA/Browser Forum baseline
+requirements require every publicly trusted code-signing certificate's private key to be generated
+and held non-exportably on FIPS 140-2 Level 2+ hardware, so a plain key file is realistically only
+an option if your CA/HSM vendor lets you export a short-lived copy for this purpose.
+
+**Sign in CI**: `.github/workflows/release.yml`'s "Sign artifacts with organization-supplied key"
+step runs automatically, and only, if this repository's own `COSIGN_PRIVATE_KEY`,
+`COSIGN_CERTIFICATE`, and `COSIGN_CERTIFICATE_CHAIN` secrets are set (plus `COSIGN_PASSWORD` if the
+key is password-encrypted). It's skipped cleanly, with the release still shipping the public keyless
+signature only, if they're unset - so forking this repo and adding your own secrets is enough to
+also sign your own builds with a Supervisor-trusted certificate, without touching the workflow
+itself. `COSIGN_PRIVATE_KEY` follows the same file-or-KMS-reference rule as `make supervisor-sign`
+above; if it's a KMS reference, add whatever cloud login step your provider needs before the signing
+step so cosign can authenticate to it.
+
+Both signatures are always by **digest**, never by tag - if the tag moves, a tag-based signature no
+longer matches what gets pulled.

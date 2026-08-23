@@ -219,10 +219,48 @@ supervisor-service-yaml: ## Emit the upload-ready Supervisor Service YAML (Packa
 	@echo "Wrote $(SUPSVC_YAML_OUT)"
 	@echo "Service ID: $(SERVICE_ID)  Version: $(VERSION)"
 
+.PHONY: supervisor-sign
+supervisor-sign: ## Sign the operator image, bundle image, and Service YAML with your own cosign key. Inputs: COSIGN_KEY, COSIGN_CERT, COSIGN_CHAIN (file paths), IMG_DIGEST (operator image, by digest).
+	@command -v cosign >/dev/null 2>&1 || { echo "cosign not found. Install: https://docs.sigstore.dev/cosign/system_config/installation/"; exit 1; }
+	@if [ -z "$(COSIGN_KEY)" ] || [ -z "$(COSIGN_CERT)" ] || [ -z "$(COSIGN_CHAIN)" ] || [ -z "$(IMG_DIGEST)" ]; then \
+		echo "ERROR: COSIGN_KEY, COSIGN_CERT, COSIGN_CHAIN, IMG_DIGEST are required."; \
+		echo "  IMG_DIGEST must be the operator image by digest, e.g. via:"; \
+		echo "    docker inspect --format='{{index .RepoDigests 0}}' \$$IMG"; \
+		echo "  Example: make supervisor-sign COSIGN_KEY=cosign.key COSIGN_CERT=cert.pem \\"; \
+		echo "           COSIGN_CHAIN=chain.pem IMG_DIGEST=ghcr.io/you/vcf-salt-operator@sha256:..."; \
+		exit 2; \
+	fi
+	@if [ ! -f dist/supervisor-bundle.lock.yml ]; then \
+		echo "ERROR: dist/supervisor-bundle.lock.yml not found. Run 'make supervisor-bundle' first."; \
+		exit 2; \
+	fi
+	@echo "Signing operator image..."
+	cosign sign --key $(COSIGN_KEY) --certificate $(COSIGN_CERT) --certificate-chain $(COSIGN_CHAIN) \
+	    --tlog-upload=false --yes $(IMG_DIGEST)
+	@echo "Signing bundle image..."
+	@bundle_digest="$$(awk '/image:/{print $$2; exit}' dist/supervisor-bundle.lock.yml)"; \
+	cosign sign --key $(COSIGN_KEY) --certificate $(COSIGN_CERT) --certificate-chain $(COSIGN_CHAIN) \
+	    --tlog-upload=false --yes "$$bundle_digest"
+	@if [ -f $(SUPSVC_YAML_OUT) ]; then \
+		echo "Signing $(SUPSVC_YAML_OUT)..."; \
+		cosign sign-blob --key $(COSIGN_KEY) --certificate $(COSIGN_CERT) --certificate-chain $(COSIGN_CHAIN) \
+		    --tlog-upload=false --yes \
+		    --output-signature $(SUPSVC_YAML_OUT).sig --output-certificate $(SUPSVC_YAML_OUT).pem \
+		    $(SUPSVC_YAML_OUT); \
+	else \
+		echo "WARN: $(SUPSVC_YAML_OUT) not found, skipping. Run 'make supervisor-service-yaml' first if you want it signed too."; \
+	fi
+	@echo
+	@echo "Signed. COSIGN_KEY may be a cosign KMS reference (e.g. azurekms://..., awskms://...) instead of a"
+	@echo "file path - the Supervisor only inspects the certificate/chain, not how the key itself is stored."
+	@echo "See config/supervisor-service/README.md's Signing section for what the certificate/chain"
+	@echo "must satisfy (a publicly trusted root - the Supervisor rejects private/self-signed CAs)."
+
 .PHONY: supervisor-release
 supervisor-release: docker-build docker-push supervisor-bundle supervisor-service-yaml ## One-shot: build+push operator image, build+push bundle, emit service YAML.
 	@echo
 	@echo "Upload $(SUPSVC_YAML_OUT) via vSphere Client -> Workload Management -> Services -> Add New Service."
+	@echo "Optional: make supervisor-sign COSIGN_KEY=... COSIGN_CERT=... COSIGN_CHAIN=... IMG_DIGEST=..."
 
 .PHONY: supervisor-relocate
 supervisor-relocate: ## Relocate bundle + referenced images to DEST_REPO (e.g. DEST_REPO=nexus.corp/vcf/vcf-salt-operator-bundle). Source = BUNDLE_IMG.
