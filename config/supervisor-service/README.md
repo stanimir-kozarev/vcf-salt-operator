@@ -1,6 +1,6 @@
 # VCF9 Supervisor Service packaging
 
-Sources for the Salt Keys Operator Supervisor Service: a Carvel
+Sources for the VCF Salt Operator Supervisor Service: a Carvel
 `PackageMetadata` + `Package` (namespace `tkg-system`) whose
 `template.spec.fetch` references an `imgpkg` bundle.
 
@@ -29,8 +29,8 @@ config/supervisor-service/
 ## Build and release (public registry)
 
 ```sh
-make supervisor-release VERSION=0.1.0 \
-    IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator:0.1.0
+make supervisor-release VERSION=0.2.0 \
+    IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator:0.2.0
 ```
 
 Produces `dist/vcf-salt-operator-supervisorservice-<VERSION>.yaml` with
@@ -48,24 +48,24 @@ bundle + operator image travel in a single tarball.
 docker run -d -p 5000:5000 --restart=always --name localreg registry:2
 
 # 2. Build and stage operator image + bundle locally.
-make supervisor-bundle VERSION=0.1.0 \
-    IMG=localhost:5000/vcf-salt-operator:0.1.0 \
-    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.1.0
+make supervisor-bundle VERSION=0.2.0 \
+    IMG=localhost:5000/vcf-salt-operator:0.2.0 \
+    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
 
 # 3. Emit the Service YAML (image path rewritten on the lab side).
-make supervisor-service-yaml VERSION=0.1.0 \
-    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.1.0
+make supervisor-service-yaml VERSION=0.2.0 \
+    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
 
 # 4. Pack bundle + images into a single tar.
-make supervisor-offline-tar VERSION=0.1.0 \
-    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.1.0
+make supervisor-offline-tar VERSION=0.2.0 \
+    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
 ```
 
 Transfer these three files to the lab (tar is the only large one, typically
 ~50 MB for a distroless Go operator):
 
-- `dist/vcf-salt-operator-airgap-0.1.0.tar`
-- `dist/vcf-salt-operator-supervisorservice-0.1.0.yaml`
+- `dist/vcf-salt-operator-airgap-0.2.0.tar`
+- `dist/vcf-salt-operator-supervisorservice-0.2.0.yaml`
 - `config/supervisor-service/sample-values.yaml`
 
 **On the lab jump host** (needs `imgpkg` + access to Nexus + vSphere Client):
@@ -74,28 +74,28 @@ Transfer these three files to the lab (tar is the only large one, typically
 docker login nexus.corp
 
 make supervisor-offline-import \
-    TAR=vcf-salt-operator-airgap-0.1.0.tar \
+    TAR=vcf-salt-operator-airgap-0.2.0.tar \
     DEST_REPO=nexus.corp/vcf/vcf-salt-operator-bundle \
-    SERVICE_YAML=vcf-salt-operator-supervisorservice-0.1.0.yaml
+    SERVICE_YAML=vcf-salt-operator-supervisorservice-0.2.0.yaml
 ```
 
 If the lab has no `make`, run the two underlying commands directly:
 
 ```sh
-imgpkg copy --tar vcf-salt-operator-airgap-0.1.0.tar \
+imgpkg copy --tar vcf-salt-operator-airgap-0.2.0.tar \
     --to-repo nexus.corp/vcf/vcf-salt-operator-bundle \
     --lock-output bundle.lock.yml
 
 DIGEST=$(awk '/image:/{print $2; exit}' bundle.lock.yml)
 sed -E -i.bak "/imgpkgBundle:/,/image:/ s|image:[[:space:]]+.*vcf-salt-operator-bundle.*|image: $DIGEST|" \
-    vcf-salt-operator-supervisorservice-0.1.0.yaml
+    vcf-salt-operator-supervisorservice-0.2.0.yaml
 ```
 
 Then:
 
 - Edit `sample-values.yaml`: set `image.repository` to
   `nexus.corp/vcf/vcf-salt-operator` and fill `imagePullSecret.dockerconfigjson`.
-- Upload `vcf-salt-operator-supervisorservice-0.1.0.yaml` via
+- Upload `vcf-salt-operator-supervisorservice-0.2.0.yaml` via
   **Workload Management → Services → Add New Service**.
 - Install on the Supervisor and paste `sample-values.yaml`.
 
@@ -107,18 +107,18 @@ resolve at Nexus.
 
 ```sh
 # 1. Build and push the source bundle (once, to any reachable registry).
-make supervisor-bundle VERSION=0.1.0 \
-    IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator:0.1.0
+make supervisor-bundle VERSION=0.2.0 \
+    IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator:0.2.0
 
 # 2. Relocate bundle + images to Nexus.
 docker login nexus.corp
 make supervisor-relocate \
-    BUNDLE_IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.1.0 \
+    BUNDLE_IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.2.0 \
     DEST_REPO=nexus.corp/vcf/vcf-salt-operator-bundle
 
 # 3. Regenerate the Supervisor Service YAML; it picks up the Nexus digest
 #    from dist/supervisor-bundle.lock.yml.
-make supervisor-service-yaml VERSION=0.1.0
+make supervisor-service-yaml VERSION=0.2.0
 ```
 
 On the Supervisor:

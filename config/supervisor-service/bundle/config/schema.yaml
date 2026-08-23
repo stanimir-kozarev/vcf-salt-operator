@@ -6,7 +6,7 @@ namespace: vcf-salt-operator-system
 #@schema/desc "Operator container image settings."
 image:
   repository: ghcr.io/stanimir-kozarev/vcf-salt-operator
-  tag: "0.1.0"
+  tag: "0.2.0"
   #@schema/validation one_of=["Always", "IfNotPresent", "Never"]
   pullPolicy: IfNotPresent
 

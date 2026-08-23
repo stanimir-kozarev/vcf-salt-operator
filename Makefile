@@ -161,7 +161,7 @@ build-installer-vcf9: manifests generate kustomize ## Generate minimal install b
 ##@ Supervisor Service (VCF9)
 
 # Release version for the Supervisor Service bundle + Package.
-VERSION          ?= 0.1.0
+VERSION          ?= 0.2.0
 # Service ID — must match PackageMetadata.metadata.name in config/supervisor-service/package/.
 SERVICE_ID       ?= vcf-salt-operator.salt.vcf.io
 # OCI bundle published by `make supervisor-bundle`.
@@ -229,7 +229,7 @@ supervisor-relocate: ## Relocate bundle + referenced images to DEST_REPO (e.g. D
 	@command -v imgpkg >/dev/null 2>&1 || { echo "imgpkg not found. Install Carvel imgpkg."; exit 1; }
 	@if [ -z "$(DEST_REPO)" ]; then \
 		echo "ERROR: DEST_REPO is required."; \
-		echo "  Example: make supervisor-relocate BUNDLE_IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.1.0 \\"; \
+		echo "  Example: make supervisor-relocate BUNDLE_IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.2.0 \\"; \
 		echo "           DEST_REPO=nexus.corp/vcf/vcf-salt-operator-bundle"; \
 		exit 2; \
 	fi
@@ -253,9 +253,9 @@ supervisor-offline-import: ## On the lab side: upload a tar to DEST_REPO and pin
 	@if [ -z "$(TAR)" ] || [ -z "$(DEST_REPO)" ] || [ -z "$(SERVICE_YAML)" ]; then \
 		echo "ERROR: TAR, DEST_REPO, SERVICE_YAML are required."; \
 		echo "  Example: make supervisor-offline-import \\"; \
-		echo "           TAR=vcf-salt-operator-airgap-0.1.0.tar \\"; \
+		echo "           TAR=vcf-salt-operator-airgap-0.2.0.tar \\"; \
 		echo "           DEST_REPO=nexus.corp/vcf/vcf-salt-operator-bundle \\"; \
-		echo "           SERVICE_YAML=vcf-salt-operator-supervisorservice-0.1.0.yaml"; \
+		echo "           SERVICE_YAML=vcf-salt-operator-supervisorservice-0.2.0.yaml"; \
 		exit 2; \
 	fi
 	imgpkg copy --tar $(TAR) --to-repo $(DEST_REPO) --lock-output supervisor-bundle.lock.yml

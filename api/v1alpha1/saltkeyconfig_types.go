@@ -60,6 +60,23 @@ type SaltKeyConfigSpec struct {
 	// +optional
 	// TODO: VMSelector is defined in the API but not yet enforced by the controller.
 	VMSelector *metav1.LabelSelector `json:"vmSelector,omitempty"`
+
+	// retryToken re-runs the Salt chain for every VirtualMachine in this namespace that is
+	// currently in a terminal Failed/<step> state. Any change to the value requests one
+	// re-run. The value itself is opaque, and a change-request identifier is preferred over
+	// a timestamp so the request carries its own audit reference. Each VM records the token
+	// it acted on in the salt.vcf.io/bulk-retry-handled annotation, so the operator acts
+	// once per distinct value and this field is never cleared by the controller.
+	//
+	// Healthy VMs are not disturbed: they record the token as handled without re-running,
+	// which both keeps "retry this environment" from becoming a fleet-wide convergence and
+	// stops a stale token re-arming against a VM that fails later for an unrelated reason.
+	//
+	// This is the Ops-side lever, for a platform-caused failure that stranded VMs across
+	// several tenant repositories. The per-VM equivalent is the salt.vcf.io/retry-request
+	// annotation, which a team sets on its own manifest.
+	// +optional
+	RetryToken string `json:"retryToken,omitempty"`
 }
 
 // SaltKeyConfigStatus defines the observed state of SaltKeyConfig.

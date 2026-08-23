@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync/atomic"
 	"time"
 
@@ -91,6 +92,15 @@ func newTestReconciler(mock *mockSaltClient) *VirtualMachineReconciler {
 		},
 		Recorder: record.NewFakeRecorder(32),
 	}
+}
+
+// mergeAnnotations returns a new map with overlay's keys layered on top of base's,
+// without mutating either input.
+func mergeAnnotations(base, overlay map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(overlay))
+	maps.Copy(out, base)
+	maps.Copy(out, overlay)
+	return out
 }
 
 // makeVM creates a minimal VirtualMachine as unstructured in the given namespace.
@@ -445,6 +455,397 @@ var _ = Describe("VirtualMachine Controller", func() {
 			_, err := reconciler.Reconcile(ctx, req)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("raas connection refused"))
+		})
+	})
+
+	Context("Day-2 change detection (full intent-annotation hash)", func() {
+		var saltCfgNS string
+
+		BeforeEach(func() {
+			saltCfgNS = "day2-" + randomSuffix()
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: saltCfgNS}}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, ns) })
+			makeSaltKeyConfig(ctx, saltCfgNS)
+			req.Namespace = saltCfgNS
+		})
+
+		// makeReadyVM builds a VM already past bootstrap (salt-status=Ready), with
+		// AnnotationRolesHash set to whatever computeIntentHash would have produced for
+		// baseAnnotations, the state as of the last successful highstate dispatch, then
+		// returns it with liveAnnotations layered on top, simulating a subsequent Argo CD
+		// sync that changed (or didn't change) the tenant-declared annotations.
+		makeReadyVM := func(baseAnnotations, liveAnnotations map[string]string) *unstructured.Unstructured {
+			GinkgoHelper()
+			// AnnotationManaged is itself part of the tenant-declared intent set (not in
+			// nonIntentAnnotations, see its own doc comment) and is unconditionally
+			// present on any VM that reaches checkReconvergence at all (Reconcile's opt-in gate
+			// requires it). The baseline hash a real prior dispatch would have stored
+			// therefore always included it too. Omitting it here would make every "no
+			// change" fixture look changed, since the live object always carries it.
+			previousHash := computeIntentHash(mergeAnnotations(map[string]string{AnnotationManaged: "true"}, baseAnnotations))
+
+			annotations := mergeAnnotations(map[string]string{
+				AnnotationManaged:    "true",
+				AnnotationKeyStatus:  "Accepted",
+				AnnotationMinionID:   vmName,
+				AnnotationSaltStatus: "Ready",
+				AnnotationReady:      "true",
+			}, liveAnnotations)
+			annotations[AnnotationRolesHash] = previousHash
+
+			vm := makeVM(vmName, saltCfgNS, annotations)
+			vm.SetFinalizers([]string{saltFinalizer})
+			return vm
+		}
+
+		It("should not dispatch when no intent annotation changed", func() {
+			state := map[string]string{AnnotationRoles: "web_server"}
+			vm := makeReadyVM(state, state)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("Ready"),
+				"unchanged intent set must not trigger a Day-2 dispatch")
+		})
+
+		It("should still dispatch on a roles change (pre-existing behavior, not regressed)", func() {
+			old := map[string]string{AnnotationRoles: "web_server"}
+			live := map[string]string{AnnotationRoles: "web_server,db_server"}
+			vm := makeReadyVM(old, live)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("HighstateDispatched"))
+			Expect(updated.GetAnnotations()[AnnotationHighstateJID]).To(Equal("mock-jid-00000000000000"))
+		})
+
+		It("should dispatch on a cis-profile change with roles held constant", func() {
+			old := map[string]string{AnnotationRoles: "web_server", "salt.vcf.io/cis-profile": "dev-standard"}
+			live := map[string]string{AnnotationRoles: "web_server", "salt.vcf.io/cis-profile": "prod-strict"}
+			vm := makeReadyVM(old, live)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("HighstateDispatched"),
+				"a cis-profile-only change was previously invisible to the roles-only hash")
+		})
+
+		// No through-envtest "tag/* change" case here deliberately: "salt.vcf.io/tag/db_port"
+		// is not a valid Kubernetes annotation key. The API server's annotation key regex
+		// allows exactly one '/', splitting an optional DNS prefix from the name, and
+		// "tag/db_port" as the name segment contains a second '/', so real VM creation with
+		// that key is rejected outright (422 FieldValueInvalid). computeIntentHash's own
+		// behavior on an arbitrary map key, irrespective of Kubernetes validity, is still
+		// covered directly by TestComputeIntentHash_DetectsIntentChanges/tag/db_port in
+		// intent_hash_test.go.
+
+		It("should dispatch on a role-less VM whose cis-profile changes", func() {
+			old := map[string]string{"salt.vcf.io/cis-profile": "dev-standard"}
+			live := map[string]string{"salt.vcf.io/cis-profile": "prod-strict"}
+			vm := makeReadyVM(old, live)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("HighstateDispatched"),
+				"a role-less VM still carries the unconditional CIS baseline, so it must not be "+
+					"excluded from Day-2 drift detection just because AnnotationRoles is empty")
+		})
+
+		It("should not dispatch on a change to an operator-written status annotation", func() {
+			old := map[string]string{AnnotationRoles: "web_server"}
+			// highstate-time is operator-written. Changing it must never itself trigger a
+			// dispatch, or every completed highstate would immediately re-trigger itself.
+			live := map[string]string{AnnotationRoles: "web_server", AnnotationHighstateTime: "2026-08-22T00:00:00Z"}
+			vm := makeReadyVM(old, live)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("Ready"))
+		})
+	})
+
+	Context("Recovery from a terminal Failed state", func() {
+		var saltCfgNS string
+
+		BeforeEach(func() {
+			saltCfgNS = "recover-" + randomSuffix()
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: saltCfgNS}}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, ns) })
+			makeSaltKeyConfig(ctx, saltCfgNS)
+			req.Namespace = saltCfgNS
+		})
+
+		// makeFailedVM builds a VM stranded in a terminal Failed/<step> state, with its
+		// stored intent hash matching baseAnnotations (the state as of the dispatch that
+		// failed) and liveAnnotations layered on top.
+		makeFailedVM := func(failedStatus string, baseAnnotations, liveAnnotations map[string]string) *unstructured.Unstructured {
+			GinkgoHelper()
+			previousHash := computeIntentHash(mergeAnnotations(map[string]string{AnnotationManaged: "true"}, baseAnnotations))
+			annotations := mergeAnnotations(map[string]string{
+				AnnotationManaged:         "true",
+				AnnotationKeyStatus:       "Accepted",
+				AnnotationMinionID:        vmName,
+				AnnotationSaltStatus:      failedStatus,
+				AnnotationReady:           "false",
+				AnnotationHighstateStatus: "Failed",
+			}, liveAnnotations)
+			annotations[AnnotationRolesHash] = previousHash
+			vm := makeVM(vmName, saltCfgNS, annotations)
+			vm.SetFinalizers([]string{saltFinalizer})
+			return vm
+		}
+
+		setBulkRetryToken := func(token string) {
+			GinkgoHelper()
+			cfg := &saltv1alpha1.SaltKeyConfig{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "salt-config", Namespace: saltCfgNS}, cfg)).To(Succeed())
+			original := cfg.DeepCopy()
+			cfg.Spec.RetryToken = token
+			Expect(k8sClient.Patch(ctx, cfg, client.MergeFrom(original))).To(Succeed())
+		}
+
+		getVM := func() *unstructured.Unstructured {
+			GinkgoHelper()
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			return updated
+		}
+
+		It("should stay stranded when nothing has changed and no retry was requested", func() {
+			state := map[string]string{AnnotationRoles: "web_server"}
+			vm := makeFailedVM("Failed/Highstate", state, state)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getVM().GetAnnotations()[AnnotationSaltStatus]).To(Equal("Failed/Highstate"),
+				"a genuinely broken VM must stay visibly broken, never silently auto-retry")
+		})
+
+		It("should reset when intent changed while the VM was stranded", func() {
+			// The IDP case: a team's first request failed, and their second, entirely valid
+			// request arrives through the same sanctioned path. This was previously accepted
+			// by Git and then silently ignored by the operator.
+			old := map[string]string{AnnotationRoles: "web_server"}
+			live := map[string]string{AnnotationRoles: "web_server,db_server"}
+			vm := makeFailedVM("Failed/Highstate", old, live)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			annotations := getVM().GetAnnotations()
+			Expect(annotations[AnnotationSaltStatus]).To(BeEmpty(), "should re-enter the chain at the start")
+			Expect(annotations[AnnotationReady]).To(Equal("false"))
+			Expect(annotations[AnnotationRolesHash]).NotTo(Equal(computeIntentHash(
+				mergeAnnotations(map[string]string{AnnotationManaged: "true"}, old))),
+				"the intent hash must be recorded at reset time, or a re-failing run loops forever")
+		})
+
+		DescribeTable("should recover from every terminal step via a retry request",
+			func(failedStatus string) {
+				state := map[string]string{AnnotationRoles: "web_server"}
+				vm := makeFailedVM(failedStatus, state,
+					mergeAnnotations(state, map[string]string{AnnotationRetryRequest: "CHG0041234"}))
+				Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+				_, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+
+				annotations := getVM().GetAnnotations()
+				Expect(annotations[AnnotationSaltStatus]).To(BeEmpty())
+				Expect(annotations[AnnotationRetryHandled]).To(Equal("CHG0041234"))
+				Expect(annotations[AnnotationRetryRequest]).To(Equal("CHG0041234"),
+					"the operator must never clear the request, or it fights Argo CD's selfHeal")
+			},
+			Entry("Failed/Ping", "Failed/Ping"),
+			Entry("Failed/PillarRefresh", "Failed/PillarRefresh"),
+			Entry("Failed/HighstateDispatch", "Failed/HighstateDispatch"),
+			Entry("Failed/Highstate", "Failed/Highstate"),
+		)
+
+		It("should not act twice on a retry token it already handled", func() {
+			// The loop guard: a retry that fails again lands back in Failed/<step>. If the
+			// handled marker were written only on success, this VM would retry forever.
+			state := map[string]string{AnnotationRoles: "web_server"}
+			vm := makeFailedVM("Failed/Highstate", state, mergeAnnotations(state, map[string]string{
+				AnnotationRetryRequest: "CHG0041234",
+				AnnotationRetryHandled: "CHG0041234",
+			}))
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getVM().GetAnnotations()[AnnotationSaltStatus]).To(Equal("Failed/Highstate"))
+		})
+
+		It("should rescue a stranded VM when the namespace bulk retry token changes", func() {
+			state := map[string]string{AnnotationRoles: "web_server"}
+			vm := makeFailedVM("Failed/Highstate", state, state)
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+			setBulkRetryToken("CHG0099999")
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			annotations := getVM().GetAnnotations()
+			Expect(annotations[AnnotationSaltStatus]).To(BeEmpty())
+			Expect(annotations[AnnotationBulkRetryHandled]).To(Equal("CHG0099999"))
+		})
+
+		It("should not re-run a healthy VM on a bulk retry, but should consume the token", func() {
+			// Bulk retry rescues stranded VMs only, which is what makes "retry this
+			// environment" safe rather than a fleet-wide convergence. Consuming the token
+			// stops it re-arming against a VM that fails weeks later for another reason.
+			state := map[string]string{AnnotationRoles: "web_server"}
+			annotations := mergeAnnotations(map[string]string{
+				AnnotationManaged:    "true",
+				AnnotationKeyStatus:  "Accepted",
+				AnnotationMinionID:   vmName,
+				AnnotationSaltStatus: "Ready",
+				AnnotationReady:      "true",
+			}, state)
+			annotations[AnnotationRolesHash] = computeIntentHash(
+				mergeAnnotations(map[string]string{AnnotationManaged: "true"}, state))
+			vm := makeVM(vmName, saltCfgNS, annotations)
+			vm.SetFinalizers([]string{saltFinalizer})
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+			setBulkRetryToken("CHG0099999")
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := getVM().GetAnnotations()
+			Expect(updated[AnnotationSaltStatus]).To(Equal("Ready"), "a healthy VM must not be disturbed")
+			Expect(updated[AnnotationBulkRetryHandled]).To(Equal("CHG0099999"), "but must consume the token")
+		})
+
+		It("should force a re-run on a healthy VM when a retry is explicitly requested", func() {
+			// The break-glass follow-up: Ops repaired the VM out of band, and the operator's
+			// own record has to catch up with a reality it never observed.
+			state := map[string]string{AnnotationRoles: "web_server"}
+			annotations := mergeAnnotations(map[string]string{
+				AnnotationManaged:      "true",
+				AnnotationKeyStatus:    "Accepted",
+				AnnotationMinionID:     vmName,
+				AnnotationSaltStatus:   "Ready",
+				AnnotationReady:        "true",
+				AnnotationRetryRequest: "CHG0042000",
+			}, state)
+			annotations[AnnotationRolesHash] = computeIntentHash(
+				mergeAnnotations(map[string]string{AnnotationManaged: "true"}, state))
+			vm := makeVM(vmName, saltCfgNS, annotations)
+			vm.SetFinalizers([]string{saltFinalizer})
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := getVM().GetAnnotations()
+			Expect(updated[AnnotationSaltStatus]).To(Equal("HighstateDispatched"))
+			Expect(updated[AnnotationRetryHandled]).To(Equal("CHG0042000"))
+		})
+	})
+
+	Context("Intent hash format migration", func() {
+		var saltCfgNS string
+
+		BeforeEach(func() {
+			saltCfgNS = "migrate-" + randomSuffix()
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: saltCfgNS}}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, ns) })
+			makeSaltKeyConfig(ctx, saltCfgNS)
+			req.Namespace = saltCfgNS
+		})
+
+		makeReadyVMWithHash := func(roles, storedHash string) *unstructured.Unstructured {
+			GinkgoHelper()
+			vm := makeVM(vmName, saltCfgNS, map[string]string{
+				AnnotationManaged:    "true",
+				AnnotationKeyStatus:  "Accepted",
+				AnnotationMinionID:   vmName,
+				AnnotationSaltStatus: "Ready",
+				AnnotationReady:      "true",
+				AnnotationRoles:      roles,
+				AnnotationRolesHash:  storedHash,
+			})
+			vm.SetFinalizers([]string{saltFinalizer})
+			return vm
+		}
+
+		It("should adopt a pre-upgrade hash in place without dispatching", func() {
+			// Without this, every VM in the fleet mismatches on first reconcile after the
+			// operator upgrade and converges at once, which is an unannounced mass action.
+			vm := makeReadyVMWithHash("web_server", computeLegacyRolesHash("web_server"))
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("Ready"),
+				"migration must not dispatch")
+			Expect(updated.GetAnnotations()[AnnotationRolesHash]).To(HavePrefix(intentHashVersion))
+		})
+
+		It("should still dispatch when roles genuinely changed before the upgrade", func() {
+			// Suppressing the difference blindly would swallow a real change made while the
+			// old operator was running, so the old algorithm is recomputed to tell them apart.
+			vm := makeReadyVMWithHash("web_server,db_server", computeLegacyRolesHash("web_server"))
+			Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &unstructured.Unstructured{}
+			updated.SetGroupVersionKind(virtualMachineGVK)
+			Expect(k8sClient.Get(ctx, req.NamespacedName, updated)).To(Succeed())
+			Expect(updated.GetAnnotations()[AnnotationSaltStatus]).To(Equal("HighstateDispatched"))
 		})
 	})
 

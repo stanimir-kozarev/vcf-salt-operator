@@ -7,7 +7,7 @@ metadata:
   name: vcf-salt-operator.salt.vcf.io
   namespace: tkg-system
 spec:
-  displayName: "Salt Keys Operator"
+  displayName: "VCF Salt Operator"
   shortDescription: "Salt minion key lifecycle manager for VCF9 Supervisor"
   longDescription: |
     Kubernetes operator that manages SaltStack minion key lifecycle for

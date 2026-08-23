@@ -83,7 +83,7 @@ jobs:
         run: |
           make manifests generate
           mkdir -p dist
-          cd config/manager && kustomize edit set image controller=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          cd config/manager && kustomize edit set image controller=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           cd ../.. && kustomize build config/vcf9 > dist/install-vcf9.yaml
 
       - name: Create GitHub Release

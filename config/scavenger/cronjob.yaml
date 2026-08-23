@@ -23,9 +23,8 @@ spec:
           - name: scavenger
             image: ghcr.io/stanimir-kozarev/vcf-salt-operator:latest  # replace with pinned tag
             command: ["/scavenger"]
-            args:
-            # Remove --dry-run to enable actual key deletion
-            - "--dry-run"
+            # --dry-run defaults to true: the scavenger reports stale keys but deletes
+            # nothing. Pass --dry-run=false explicitly to enable deletion.
             resources:
               requests:
                 cpu: 50m

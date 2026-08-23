@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"maps"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,14 @@ const postAcceptDelay = 30 * time.Second
 // terminal and requires operator intervention.
 const maxBootstrapDuration = 10 * time.Minute
 
+// intentHashVersion prefixes every digest computeIntentHash produces, so a legacy-format
+// hash (no prefix) is distinguishable from a current one. See adoptLegacyIntentHash.
+const intentHashVersion = "v2:"
+
+// failedStatusPrefix marks the terminal Failed/<step> states. checkReconvergence is the
+// only way out of one.
+const failedStatusPrefix = "Failed/"
+
 // Salt annotation keys written by this operator onto VirtualMachine resources.
 const (
 	// AnnotationManaged opts a VirtualMachine into Salt key management.
@@ -91,8 +100,12 @@ const (
 	// The operator watches this annotation for Day-2 change detection.
 	AnnotationRoles = "salt.vcf.io/roles"
 
-	// AnnotationRolesHash is the SHA256 hash of AnnotationRoles at the time of last highstate dispatch.
-	// A mismatch triggers a Day-2 refresh_pillar + highstate cycle.
+	// AnnotationRolesHash is the SHA256 hash of the full tenant-declared intent-annotation
+	// set (every salt.vcf.io/* key except the operator's own status keys, see
+	// operatorStatusAnnotations) at the time of the last highstate dispatch. A mismatch
+	// triggers a Day-2 refresh_pillar + highstate cycle. Kept under its original name (this
+	// used to hash AnnotationRoles alone, see computeIntentHash's doc comment) since it is
+	// already part of the documented intent-vs-status annotation split app teams rely on.
 	AnnotationRolesHash = "salt.vcf.io/roles-hash"
 
 	// AnnotationAcceptedAt is the RFC3339 timestamp when the Salt key was accepted.
@@ -107,7 +120,60 @@ const (
 	// AnnotationHighstateFailedStates is a comma-separated list of failed state IDs from
 	// the last highstate run. Contains only state map keys, never rendered values or secrets.
 	AnnotationHighstateFailedStates = "salt.vcf.io/highstate-failed-states"
+
+	// AnnotationRetryRequest is a tenant-set, Git-delivered trigger asking the operator to
+	// re-run the Salt chain. An opaque token compared against AnnotationRetryHandled: any
+	// change requests one re-run.
+	//
+	// The operator never clears this annotation, only records what it acted on. Clearing it
+	// would fight Argo CD's selfHeal, since the Git-asserted value would never be satisfied.
+	AnnotationRetryRequest = "salt.vcf.io/retry-request"
+
+	// AnnotationRetryHandled records the AnnotationRetryRequest value the operator last
+	// acted on. An annotation, not a status field, because this operator does not own the
+	// VirtualMachine CRD.
+	AnnotationRetryHandled = "salt.vcf.io/retry-handled"
+
+	// AnnotationBulkRetryHandled records the SaltKeyConfig.spec.retryToken value this VM
+	// last acted on. Held per VM, not once on the SaltKeyConfig, since a single shared
+	// record would race: the first VM to reconcile would mark the token consumed for every
+	// other VM in the namespace.
+	AnnotationBulkRetryHandled = "salt.vcf.io/bulk-retry-handled"
 )
+
+// nonIntentAnnotations is the set of salt.vcf.io/* keys excluded from the intent hash.
+// A deny-list, not an allow-list, so a new tenant annotation is picked up for Day-2 change
+// detection automatically, with no code change.
+//
+// Two reasons for exclusion:
+//   - Operator-written status: including these would make the operator's own writes look
+//     like tenant intent, and every completed highstate would re-trigger itself.
+//   - Operational triggers: AnnotationRetryRequest is tenant-written like an intent
+//     annotation, but requests an action rather than describing desired configuration, so
+//     it is handled explicitly in checkReconvergence instead.
+//
+// AnnotationManaged and AnnotationRoles are deliberately absent - both are tenant-declared
+// configuration, so both belong in the hash.
+var nonIntentAnnotations = map[string]bool{
+	// Operator-written status
+	AnnotationKeyStatus:             true,
+	AnnotationMinionID:              true,
+	AnnotationMatchMethod:           true,
+	AnnotationSaltStatus:            true,
+	AnnotationReady:                 true,
+	AnnotationHighstateJID:          true,
+	AnnotationHighstateStatus:       true,
+	AnnotationHighstateTime:         true,
+	AnnotationRolesHash:             true,
+	AnnotationAcceptedAt:            true,
+	AnnotationHighstateFailedCount:  true,
+	AnnotationHighstateFailedStates: true,
+	AnnotationRetryHandled:          true,
+	AnnotationBulkRetryHandled:      true,
+
+	// Operational triggers
+	AnnotationRetryRequest: true,
+}
 
 // virtualMachineGVK is the GroupVersionKind for the VM Service VirtualMachine resource.
 // Using unstructured avoids a Go dependency on the vmoperator types package.
@@ -274,7 +340,7 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 		return ctrl.Result{}, fmt.Errorf("get salt client for %s: %w", vm.GetName(), err)
 	}
 	minionID := vm.GetAnnotations()[AnnotationMinionID]
-	return r.reconcilePostAccept(ctx, vm, saltClient, minionID, requeueAfter)
+	return r.reconcilePostAccept(ctx, vm, saltClient, cfg, minionID, requeueAfter)
 }
 
 // runAcceptKey looks for a pending Salt key that matches this VM and accepts it.
@@ -339,11 +405,15 @@ func (r *VirtualMachineReconciler) runAcceptKey(
 
 // reconcilePostAccept drives the post-accept state machine:
 // "" → Pinged → PillarRefreshed → HighstateDispatched → Ready (then Day-2 loop).
-// Failed/<step> states are terminal — user must intervene.
+//
+// Both Ready and every terminal Failed/<step> state route to checkReconvergence. Failed
+// does not mean the state machine will never advance again - it means it will not advance
+// on its own, and needs one of checkReconvergence's explicit triggers to leave.
 func (r *VirtualMachineReconciler) reconcilePostAccept(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
 	saltClient salt.Client,
+	cfg *saltv1alpha1.SaltKeyConfig,
 	minionID string,
 	requeueAfter time.Duration,
 ) (ctrl.Result, error) {
@@ -372,10 +442,10 @@ func (r *VirtualMachineReconciler) reconcilePostAccept(
 		return r.runPollHighstate(ctx, vm, saltClient, minionID,
 			vm.GetAnnotations()[AnnotationHighstateJID], requeueAfter)
 	case "Ready":
-		return r.checkDay2(ctx, vm, saltClient, minionID, requeueAfter)
+		return r.checkReconvergence(ctx, vm, saltClient, cfg, minionID, requeueAfter)
 	default:
-		// Failed/<step> — terminal; logged in the event that set it
-		return ctrl.Result{}, nil
+		// Failed/<step>. Not self-advancing, but reachable by an explicit trigger.
+		return r.checkReconvergence(ctx, vm, saltClient, cfg, minionID, requeueAfter)
 	}
 }
 
@@ -512,13 +582,13 @@ func (r *VirtualMachineReconciler) runDispatchHighstate(
 		return ctrl.Result{}, nil
 	}
 
-	rolesHash := computeRolesHash(vm.GetAnnotations()[AnnotationRoles])
+	intentHash := computeIntentHash(vm.GetAnnotations())
 	if err := r.patchAnnotations(ctx, vm, map[string]string{
 		AnnotationSaltStatus:      "HighstateDispatched",
 		AnnotationHighstateJID:    jid,
 		AnnotationHighstateStatus: "InProgress",
 		AnnotationReady:           "false",
-		AnnotationRolesHash:       rolesHash,
+		AnnotationRolesHash:       intentHash,
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -593,29 +663,106 @@ func (r *VirtualMachineReconciler) runPollHighstate(
 	return ctrl.Result{}, nil
 }
 
-// checkDay2 detects role changes (via AnnotationRoles hash) and re-triggers the
-// refresh_pillar → highstate chain when Argo CD pushes a new roles list.
-func (r *VirtualMachineReconciler) checkDay2(
+// checkReconvergence decides whether a VM that will not advance on its own should re-run
+// the Salt chain. Reached from Ready and from every terminal Failed/<step> state, evaluating
+// three triggers:
+//
+//  1. The intent hash changed - Argo CD delivered new desired configuration. Needs no new
+//     annotation; alone, this is what lets a second self-service request after a failed
+//     first one actually take effect.
+//  2. AnnotationRetryRequest differs from AnnotationRetryHandled - covers what a hash
+//     cannot: the VM's own intent never changed, but the platform content that broke it has
+//     since been fixed, or Ops repaired the VM out of band.
+//  3. SaltKeyConfig.spec.retryToken differs from AnnotationBulkRetryHandled - the Ops-side
+//     lever for a platform-caused failure that stranded VMs across several tenant repos.
+//
+// Not gated on AnnotationRoles being non-empty, since a role-less VM still receives the
+// unconditional CIS baseline. The real gate is whether a highstate has ever been dispatched
+// (an empty AnnotationRolesHash).
+//
+// No automatic retry: every path needs an explicit trigger, so a broken VM stays visibly
+// broken rather than looping against a failure nobody has looked at.
+func (r *VirtualMachineReconciler) checkReconvergence(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
 	saltClient salt.Client,
+	cfg *saltv1alpha1.SaltKeyConfig,
 	minionID string,
 	requeueAfter time.Duration,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	annotations := vm.GetAnnotations()
 
-	rolesVal := annotations[AnnotationRoles]
-	if rolesVal == "" {
-		return ctrl.Result{}, nil // no roles managed — nothing to watch
+	previousHash := annotations[AnnotationRolesHash]
+	if previousHash == "" {
+		return ctrl.Result{}, nil // no prior dispatch to compare against
 	}
-	currentHash := computeRolesHash(rolesVal)
-	if currentHash == annotations[AnnotationRolesHash] {
-		return ctrl.Result{}, nil // no change
+	if !strings.HasPrefix(previousHash, intentHashVersion) {
+		if done, err := r.adoptLegacyIntentHash(ctx, vm, previousHash); done || err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
-	log.Info("Roles annotation changed, triggering Day-2 refresh_pillar + highstate",
-		"name", vm.GetName(), "minionID", minionID)
+	failed := strings.HasPrefix(annotations[AnnotationSaltStatus], failedStatusPrefix)
+	intentChanged := computeIntentHash(annotations) != previousHash
+
+	retryRequest := annotations[AnnotationRetryRequest]
+	retryRequested := retryRequest != "" && retryRequest != annotations[AnnotationRetryHandled]
+
+	var bulkToken string
+	if cfg != nil {
+		bulkToken = cfg.Spec.RetryToken
+	}
+	bulkChanged := bulkToken != "" && bulkToken != annotations[AnnotationBulkRetryHandled]
+
+	// A bulk token rescues stranded VMs only. Healthy VMs still record it as handled, so
+	// that "retry this environment" cannot be re-armed against a VM that fails weeks later
+	// for an unrelated reason.
+	if !intentChanged && !retryRequested && (!bulkChanged || !failed) {
+		if bulkChanged {
+			return ctrl.Result{}, r.patchAnnotations(ctx, vm, map[string]string{
+				AnnotationBulkRetryHandled: bulkToken,
+			})
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Reset to the start of the chain rather than resuming at the failed step: ping proves
+	// the minion is reachable again, and re-entering at "" keeps refresh_pillar always
+	// preceding highstate.
+	//
+	// Trigger markers are recorded HERE, before the chain runs, not after it succeeds. A
+	// retry that fails again would otherwise land back in Failed/<step> with its trigger
+	// still unequal to its handled marker, and the operator would retry forever.
+	if failed {
+		log.Info("Reconvergence triggered from a terminal state, resetting the Salt chain",
+			"name", vm.GetName(), "minionID", minionID,
+			"from", annotations[AnnotationSaltStatus],
+			"intentChanged", intentChanged, "retryRequested", retryRequested,
+			"bulkRetry", bulkChanged)
+		patch := map[string]string{
+			AnnotationSaltStatus:      "",
+			AnnotationReady:           "false",
+			AnnotationHighstateStatus: "",
+			AnnotationRolesHash:       computeIntentHash(annotations),
+		}
+		if retryRequested {
+			patch[AnnotationRetryHandled] = retryRequest
+		}
+		if bulkChanged {
+			patch[AnnotationBulkRetryHandled] = bulkToken
+		}
+		if err := r.patchAnnotations(ctx, vm, patch); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltReconvergenceRequested",
+			fmt.Sprintf("Re-running the Salt chain for minion %q after a terminal failure", minionID))
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	log.Info("Reconvergence triggered, running refresh_pillar + highstate",
+		"name", vm.GetName(), "minionID", minionID,
+		"intentChanged", intentChanged, "retryRequested", retryRequested)
 
 	rfCtx, rfCancel := context.WithTimeout(ctx, postAcceptStepTimeout)
 	defer rfCancel()
@@ -652,14 +799,22 @@ func (r *VirtualMachineReconciler) checkDay2(
 		return ctrl.Result{}, nil
 	}
 
-	// Record new roles hash and JID atomically — next reconcile enters runPollHighstate.
-	if err := r.patchAnnotations(ctx, vm, map[string]string{
+	// Record the new intent hash, every trigger marker, and the JID atomically, so the next
+	// reconcile enters runPollHighstate with nothing left that could re-trigger this path.
+	patch := map[string]string{
 		AnnotationSaltStatus:      "HighstateDispatched",
 		AnnotationHighstateJID:    jid,
 		AnnotationHighstateStatus: "InProgress",
 		AnnotationReady:           "false",
-		AnnotationRolesHash:       currentHash,
-	}); err != nil {
+		AnnotationRolesHash:       computeIntentHash(annotations),
+	}
+	if retryRequested {
+		patch[AnnotationRetryHandled] = retryRequest
+	}
+	if bulkChanged {
+		patch[AnnotationBulkRetryHandled] = bulkToken
+	}
+	if err := r.patchAnnotations(ctx, vm, patch); err != nil {
 		return ctrl.Result{}, err
 	}
 	log.Info("Day-2 highstate dispatched", "name", vm.GetName(), "minionID", minionID, "jid", jid)
@@ -668,11 +823,84 @@ func (r *VirtualMachineReconciler) checkDay2(
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// computeRolesHash returns a short SHA-256 hex digest of the roles annotation value.
-// Used for Day-2 change detection — a mismatch with AnnotationRolesHash triggers re-dispatch.
-func computeRolesHash(roles string) string {
+// computeIntentHash returns a short SHA-256 hex digest over every tenant-declared
+// salt.vcf.io/* annotation on the VM: every key with that prefix except the operator's own
+// status keys (operatorStatusAnnotations). Used for Day-2 change detection: a mismatch with
+// AnnotationRolesHash triggers a refresh_pillar + highstate re-dispatch.
+//
+// Hashing the full intent set, not just roles, means a tag/*, cis-profile,
+// cis-exceptions/*, environment, or vault-path change also triggers Day-2, matching the
+// documented vm:tags:db_port override mechanism (which needs a change to take effect after
+// initial bootstrap, not only at creation time). The deny-list is checked against, rather
+// than an allow-list of known intent keys, so a newly introduced tenant annotation kind is
+// covered automatically, with no need to special-case each one here.
+//
+// Keys are sorted before hashing so the digest is independent of map iteration order. Go
+// randomizes map iteration order per process, so an unsorted digest would flap between
+// reconciles even with no actual annotation change, causing a spurious Day-2 dispatch loop.
+func computeIntentHash(annotations map[string]string) string {
+	keys := make([]string, 0, len(annotations))
+	for k := range annotations {
+		if !strings.HasPrefix(k, "salt.vcf.io/") || nonIntentAnnotations[k] {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(annotations[k])
+		b.WriteByte('\n')
+	}
+	h := sha256.Sum256([]byte(b.String()))
+	return intentHashVersion + hex.EncodeToString(h[:8])
+}
+
+// computeLegacyRolesHash reproduces the legacy hash algorithm, which covers only the roles
+// annotation with no version prefix. adoptLegacyIntentHash uses it to tell whether a VM
+// carrying a legacy-format hash has had a genuine roles change. Not for use in change
+// detection generally.
+func computeLegacyRolesHash(roles string) string {
 	h := sha256.Sum256([]byte(roles))
 	return hex.EncodeToString(h[:8])
+}
+
+// adoptLegacyIntentHash handles a stored hash in the legacy format (no intentHashVersion
+// prefix, roles-only).
+//
+// A legacy-format hash can never equal a current computeIntentHash digest, so comparing them
+// directly would mark every such VM as changed and dispatch all of them at once - an
+// unannounced fleet-wide mass action, unacceptable in a change-controlled environment even
+// though the underlying convergence is harmless (state runs are idempotent).
+//
+// Blindly treating a legacy hash as already current would risk silently swallowing a real,
+// pending roles change. Instead this recomputes computeLegacyRolesHash against the VM's
+// current roles value: a match means nothing the legacy hash could observe has changed, so
+// the VM is migrated to the current format in place with no dispatch; a mismatch means roles
+// genuinely changed, and the caller dispatches normally, writing the current format as a
+// side effect.
+//
+// Returns true when the caller should stop and requeue (migration written, nothing to do).
+func (r *VirtualMachineReconciler) adoptLegacyIntentHash(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	storedHash string,
+) (bool, error) {
+	annotations := vm.GetAnnotations()
+	if computeLegacyRolesHash(annotations[AnnotationRoles]) != storedHash {
+		return false, nil // real roles change predating the upgrade: let the caller dispatch
+	}
+	logf.FromContext(ctx).Info("Migrating pre-upgrade intent hash without dispatching",
+		"name", vm.GetName())
+	if err := r.patchAnnotations(ctx, vm, map[string]string{
+		AnnotationRolesHash: computeIntentHash(annotations),
+	}); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // reconcileDelete implements Phase 6: fire-and-forget key deletion on VM removal.

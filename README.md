@@ -12,6 +12,34 @@ Kubernetes operator and does not support plain Kind or kubeadm clusters.
 
 ---
 
+## Release v0.2.0
+
+**VM reconvergence from failed states.** A VM in a terminal
+`salt.vcf.io/salt-status=Failed/<step>` state is recoverable, not stuck. The operator
+re-runs the Salt bootstrap chain (`test.ping → refresh_pillar → highstate`) from a
+failed state when any of three triggers fire: the VM's intent annotations change, a new
+`salt.vcf.io/retry-request` value is set on the VM, or a new
+`SaltKeyConfig.spec.retryToken` value retries every failed VM in the namespace at
+once. The operator never clears a trigger annotation itself, it only records what it
+acted on, which keeps this safe under continuous GitOps reconciliation.
+
+**Day-2 change detection covers the full intent-annotation set.** Change detection on
+a `Ready` VM covers every tenant-set `salt.vcf.io/*` annotation the operator does not
+itself write, not just `salt.vcf.io/roles`. A change to `cis-profile`, `environment`,
+`tag/*`, `cis-exceptions/*`, `vault-path`, or any future annotation of this kind
+triggers `refresh_pillar → highstate`. A VM with no roles configured is included as
+well, since the baseline configuration applies to every managed VM.
+
+**Safer key cleanup by default.** The Scavenger CronJob's `--dry-run` flag defaults
+to `true`: deleting a key requires passing `--dry-run=false` explicitly. A key with
+no correlated VM is logged at error level in both modes, so log-based alerting can
+catch the condition before a scheduled run deletes anything.
+
+See [Phase 3 — Ready, Day-2, and reconvergence](#phase-3--ready-day-2-and-reconvergence)
+and [Scavenger CronJob](#scavenger-cronjob) below for full details.
+
+---
+
 ## Full VM lifecycle
 
 ### Phase 1 — Key acceptance
@@ -57,6 +85,9 @@ Each step advances a phase annotation (`salt.vcf.io/salt-status`):
 | `Failed/HighstateDispatch` | Highstate could not be dispatched |
 | `Failed/Highstate` | Highstate completed with one or more failed states |
 
+Every `Failed/<step>` state is recoverable, not permanent — see
+[Phase 3 — Ready, Day-2, and reconvergence](#phase-3--ready-day-2-and-reconvergence).
+
 `test.ping` and `saltutil.refresh_pillar` are retried with a 60-second backoff for up
 to 10 minutes from the acceptance timestamp. After that window, failure is terminal
 and requires operator intervention. `state.highstate` is dispatched asynchronously;
@@ -66,15 +97,33 @@ the JID is stored in `salt.vcf.io/highstate-jid` and polled on subsequent reconc
 load-bearing invariant. Pillar data is fetched from a Git-backed external pillar; if
 highstate ran against a stale pillar the wrong states would be applied.
 
-### Phase 3 — Ready and Day-2
+### Phase 3 — Ready, Day-2, and reconvergence
 
 Once highstate succeeds the operator sets `salt.vcf.io/ready=true` and enters the
-Day-2 watch loop. On every reconcile it computes a SHA-256 hash of the
-`salt.vcf.io/roles` annotation. If the hash differs from the stored
-`salt.vcf.io/roles-hash` (written at the last highstate dispatch) a new
-`refresh_pillar → highstate` cycle is triggered. This detects role changes pushed by
-GitOps (e.g. ArgoCD updating the annotation) without polling — the annotation change
-itself generates the watch event.
+Day-2 watch loop. On every reconcile it hashes the full set of tenant-set
+`salt.vcf.io/*` annotations (roles, `cis-profile`, `environment`, `tag/*`,
+`cis-exceptions/*`, `vault-path`, and any other intent annotation) and compares it
+against `salt.vcf.io/roles-hash`, written at the last highstate dispatch. A mismatch
+triggers a new `refresh_pillar → highstate` cycle. This detects any intent change
+pushed by GitOps (e.g. ArgoCD updating an annotation) without polling — the
+annotation change itself generates the watch event. A VM with no roles configured is
+included, since the baseline configuration applies regardless of roles.
+
+A VM in a terminal `Failed/<step>` state reaches the same reconvergence check, not
+just `Ready` VMs. Besides an intent-hash change, two more triggers can pull a failed
+VM back into the bootstrap chain:
+
+- `salt.vcf.io/retry-request` is set to a new value (any value different from
+  `salt.vcf.io/retry-handled`, which the operator writes once it acts).
+- `SaltKeyConfig.spec.retryToken` is set to a new value, retrying every VM in the
+  namespace currently in a `Failed/<step>` state.
+
+A retry reconvergence resets to the start of the chain (`test.ping` first) rather than
+resuming at the failed step, so a stale connection is re-verified before anything else
+runs. The operator never clears `retry-request` or `retryToken` itself, it only
+records what it last acted on in `salt.vcf.io/retry-handled` /
+`salt.vcf.io/bulk-retry-handled` — this is what makes the trigger safe to leave set
+in Git under continuous GitOps reconciliation.
 
 ### VM deletion
 
@@ -104,8 +153,10 @@ When a VM's `DeletionTimestamp` is set the finalizer fires:
 | `salt.vcf.io/highstate-time` | RFC3339 timestamp | Completion time of the last highstate |
 | `salt.vcf.io/highstate-failed-count` | integer string | Number of failed states (`0` = all succeeded) |
 | `salt.vcf.io/highstate-failed-states` | comma-separated state IDs | Failed state identifiers — contains only state map keys, never rendered values or secrets |
-| `salt.vcf.io/roles-hash` | hex string | SHA-256 hash of `salt.vcf.io/roles` at last highstate dispatch |
+| `salt.vcf.io/roles-hash` | hex string, `v2:`-prefixed | Hash of the full tenant-set `salt.vcf.io/*` intent-annotation set at last highstate dispatch |
 | `salt.vcf.io/accepted-at` | RFC3339 timestamp | When the key was accepted; drives grace period and retry window |
+| `salt.vcf.io/retry-handled` | string | Last `salt.vcf.io/retry-request` value the operator acted on |
+| `salt.vcf.io/bulk-retry-handled` | string | Last `SaltKeyConfig.spec.retryToken` value this VM acted on |
 
 `salt.vcf.io/highstate-failed-count` and `salt.vcf.io/highstate-failed-states` are
 safe to expose to application teams. They contain Salt state IDs (e.g.
@@ -118,6 +169,7 @@ tree with no rendered pillar values, secrets, or command output.
 |---|---|
 | `salt.vcf.io/managed` | Set to `"true"` to opt a VM into Salt key management |
 | `salt.vcf.io/roles` | Comma-separated role list watched for Day-2 changes (e.g. `web_server,monitoring_agent`) |
+| `salt.vcf.io/retry-request` | Any value different from `salt.vcf.io/retry-handled` re-runs the Salt chain, including from a `Failed/<step>` state |
 
 ---
 
@@ -151,6 +203,7 @@ spec:
   skipTLSVerify: false                  # Set true for self-signed RaaS certificates
   acceptTimeout: "10m"                  # How long to wait for a pending key before marking Failed
   requeueInterval: "30s"               # How often to re-check for pending keys
+  retryToken: ""                        # Any new value retries every Failed/<step> VM in this namespace
 ```
 
 The `SaltKeyConfigReconciler` validates the referenced Secret and sets
@@ -185,7 +238,7 @@ Set these variables once for your environment before running any command below:
 ```bash
 export IMAGE_REPO=<image-repository>   # e.g. ghcr.io/stanimir-kozarev/vcf-salt-operator
 export BUNDLE_REPO=<bundle-repository> # e.g. ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle
-export VERSION=<version>               # e.g. 0.1.0
+export VERSION=<version>               # e.g. 0.2.0
 ```
 
 ---
@@ -647,12 +700,33 @@ kubectl annotate vm <vm-name> -n <tenant-namespace> \
   salt.vcf.io/roles='web_server,monitoring_agent,database_client' --overwrite
 ```
 
-The operator detects the hash change on the next reconcile and re-runs
+The operator detects the intent-hash change on the next reconcile and re-runs
 `refresh_pillar → highstate`. The log will show:
 
 ```
-Roles annotation changed, triggering Day-2 refresh_pillar + highstate
-Day-2 highstate dispatched   minionID=<vm-name>  jid=<jid>
+Reconvergence triggered, running refresh_pillar + highstate   minionID=<vm-name>
+Day-2 highstate dispatched                                    minionID=<vm-name>  jid=<jid>
+```
+
+**Retry a VM stuck in a `Failed/<step>` state:**
+
+```bash
+kubectl annotate vm <vm-name> -n <tenant-namespace> \
+  salt.vcf.io/retry-request="$(date +%s)" --overwrite
+```
+
+**Retry every failed VM in a namespace at once:**
+
+```bash
+kubectl patch saltkeyconfig default -n <tenant-namespace> --type=merge \
+  -p '{"spec":{"retryToken":"'"$(date +%s)"'"}}'
+```
+
+Either trigger resets the affected VM to the start of the bootstrap chain. The log
+will show:
+
+```
+Reconvergence triggered from a terminal state, resetting the Salt chain   minionID=<vm-name>  from=Failed/Highstate
 ```
 
 ---
@@ -664,8 +738,15 @@ If the operator was offline when a VM was deleted the finalizer never fires and 
 key remains in RaaS as an orphan.
 
 The **Scavenger CronJob** runs nightly inside the operator namespace and reconciles
-this: it lists all accepted keys in RaaS, checks whether a corresponding VM still
-exists in any Supervisor namespace, and deletes keys whose VMs are gone.
+this: it lists all accepted keys in RaaS and checks whether any VM in any Supervisor
+namespace still carries the matching `salt.vcf.io/minion-id` annotation.
+
+The Scavenger runs in report-only mode by default (`--dry-run=true`): a key with no
+correlated VM is logged at error level but never deleted. This also covers a VM whose
+CR was recreated after its key was already accepted, which legitimately has no
+`salt.vcf.io/minion-id` annotation yet but is still live — surfacing it rather than
+deleting it avoids acting on that false positive. Pass `--dry-run=false` to the
+CronJob's container args to enable deletion once the report has been reviewed.
 
 The Scavenger is included in the Supervisor Service bundle and requires no separate
 configuration.

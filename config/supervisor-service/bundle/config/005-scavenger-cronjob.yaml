@@ -33,9 +33,8 @@ spec:
             image: #@ "{}:{}".format(data.values.image.repository, data.values.image.tag)
             imagePullPolicy: #@ data.values.image.pullPolicy
             command: ["/scavenger"]
-            args:
-            #! Remove --dry-run after validating behaviour in your environment.
-            - "--dry-run"
+            #! --dry-run defaults to true: the scavenger reports stale keys but deletes
+            #! nothing. Pass --dry-run=false explicitly to enable deletion.
             volumeMounts:
             - name: tmp
               mountPath: /tmp

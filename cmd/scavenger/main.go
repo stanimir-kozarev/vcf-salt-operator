@@ -4,16 +4,22 @@ Copyright (c) 2025 Stan Kozarev.
 SPDX-License-Identifier: MIT
 */
 
-// cmd/scavenger is a one-shot job intended to run as a Kubernetes CronJob.
-// It reconciles stale accepted Salt minion keys — keys that are still "accepted"
-// in VCF Salt (RaaS) but whose VirtualMachine no longer exists in K8s.
+// cmd/scavenger is a one-shot job intended to run as a Kubernetes CronJob. It reconciles
+// stale accepted Salt minion keys - keys still "accepted" in VCF Salt (RaaS) but whose
+// VirtualMachine no longer carries the matching salt.vcf.io/minion-id annotation in K8s,
+// either because the operator missed a VM deletion event, or because a VM's CR was
+// recreated and lost the annotation while its key was already accepted. The second case is
+// a false positive, not a confirmed orphan, which is why deletion defaults off.
 //
-// This handles the case where the operator missed a VM deletion event
-// (e.g., the operator was down when the VM was deleted).
+// The default is report-only: deletion requires an explicit --dry-run=false. A key with no
+// correlated VM is logged at error level in both modes, so log-based alerting can catch it
+// before anything is removed.
 //
 // Usage:
 //
-//	scavenger [--dry-run] [--kubeconfig <path>]
+//	scavenger [--dry-run=false] [--kubeconfig <path>]
+//
+// --kubeconfig is registered by an imported controller-runtime package, not here.
 package main
 
 import (
@@ -23,14 +29,13 @@ import (
 	"os"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -48,12 +53,25 @@ var vmGVK = schema.GroupVersionKind{
 
 const annotationMinionID = "salt.vcf.io/minion-id"
 
+// defaultDryRun is report-only, since the only correlation signal this job trusts is an
+// annotation a recreated VM CR can legitimately lack while still being live.
+const defaultDryRun = true
+
+// saltClientFactory builds the RaaS client, a parameter rather than a direct
+// salt.NewRaaSClient call so tests can substitute a fake client.
+type saltClientFactory func(
+	raasURL, username, password, masterID string,
+	skipTLSVerify bool,
+	log logr.Logger,
+) salt.Client
+
 func main() {
 	var dryRun bool
-	var kubeconfig string
 
-	flag.BoolVar(&dryRun, "dry-run", false, "Log stale keys but do not delete them")
-	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (defaults to in-cluster config)")
+	flag.BoolVar(&dryRun, "dry-run", defaultDryRun,
+		"Report stale keys without deleting them. Pass --dry-run=false to actually delete")
+	// --kubeconfig itself is registered by sigs.k8s.io/controller-runtime/pkg/client/config's
+	// own init(), not here. Registering it a second time panics with "flag redefined".
 	flag.Parse()
 
 	logf.SetLogger(zap.New(zap.UseDevMode(true)))
@@ -62,33 +80,31 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	k8sClient, err := buildClient(kubeconfig)
+	k8sClient, err := buildClient()
 	if err != nil {
 		log.Error(err, "Could not build Kubernetes client")
 		os.Exit(1)
 	}
 
 	if dryRun {
-		log.Info("Running in dry-run mode — no keys will be deleted")
+		log.Info("Running in dry-run mode, no keys will be deleted")
 	}
 
-	if err := scavenge(ctx, k8sClient, dryRun); err != nil {
+	newSaltClient := func(raasURL, username, password, masterID string, skipTLS bool, log logr.Logger) salt.Client {
+		return salt.NewRaaSClient(raasURL, username, password, masterID, skipTLS, log)
+	}
+	if err := scavenge(ctx, k8sClient, dryRun, newSaltClient); err != nil {
 		log.Error(err, "Scavenge run failed")
 		os.Exit(1)
 	}
 	log.Info("Scavenge complete")
 }
 
-// buildClient creates a controller-runtime client.
-func buildClient(kubeconfigPath string) (client.Client, error) {
-	var restCfg *rest.Config
-	var err error
-
-	if kubeconfigPath != "" {
-		restCfg, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
-	} else {
-		restCfg, err = ctrlconfig.GetConfig()
-	}
+// buildClient creates a controller-runtime client. ctrlconfig.GetConfig() already
+// honors --kubeconfig, the KUBECONFIG environment variable, in-cluster config, and
+// $HOME/.kube/config, in that order, so no separate flag handling is needed here.
+func buildClient() (client.Client, error) {
+	restCfg, err := ctrlconfig.GetConfig()
 	if err != nil {
 		return nil, fmt.Errorf("build rest config: %w", err)
 	}
@@ -113,7 +129,7 @@ type raasGroup struct {
 // scavenge iterates over all ready SaltKeyConfigs, groups them by RaaS URL so
 // that live-VM lookups cover every managed namespace on that RaaS, and then
 // deletes accepted keys that have no corresponding VM in any of those namespaces.
-func scavenge(ctx context.Context, k8sClient client.Client, dryRun bool) error {
+func scavenge(ctx context.Context, k8sClient client.Client, dryRun bool, newSaltClient saltClientFactory) error {
 	log := logf.FromContext(ctx).WithName("scavenge")
 
 	cfgList := &saltv1alpha1.SaltKeyConfigList{}
@@ -139,7 +155,7 @@ func scavenge(ctx context.Context, k8sClient client.Client, dryRun bool) error {
 	}
 
 	for url, g := range groups {
-		if err := scavengeRaasGroup(ctx, k8sClient, g, dryRun); err != nil {
+		if err := scavengeRaasGroup(ctx, k8sClient, g, dryRun, newSaltClient); err != nil {
 			log.Error(err, "Failed to scavenge RaaS group", "raasURL", url)
 		}
 	}
@@ -154,6 +170,7 @@ func scavengeRaasGroup(
 	k8sClient client.Client,
 	g *raasGroup,
 	dryRun bool,
+	newSaltClient saltClientFactory,
 ) error {
 	cfg := g.representative
 	log := logf.FromContext(ctx).WithValues("raasURL", cfg.Spec.RaasURL, "namespaces", g.namespaces)
@@ -170,7 +187,7 @@ func scavengeRaasGroup(
 	username := string(secret.Data["username"])
 	password := string(secret.Data["password"])
 
-	saltClient := salt.NewRaaSClient(
+	saltClient := newSaltClient(
 		cfg.Spec.RaasURL, username, password,
 		cfg.Spec.MasterID, cfg.Spec.SkipTLSVerify, log.WithName("raas"),
 	)
@@ -212,11 +229,12 @@ func scavengeRaasGroup(
 		}
 		stale++
 		if dryRun {
-			log.Info("Would delete stale key (dry-run)", "minionID", key)
+			log.Error(nil, "Accepted key has no correlated VM, not deleting in dry-run mode", "minionID", key)
 			continue
 		}
+		log.Error(nil, "Accepted key has no correlated VM, deleting", "minionID", key)
 		if err := saltClient.DeleteKey(ctx, key); err != nil {
-			log.Error(err, "Could not delete stale key (continuing)", "minionID", key)
+			log.Error(err, "Could not delete stale key, continuing", "minionID", key)
 		} else {
 			log.Info("Deleted stale Salt key", "minionID", key)
 			deleted++
