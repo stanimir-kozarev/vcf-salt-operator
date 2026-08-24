@@ -38,37 +38,37 @@ Produces `dist/vcf-salt-operator-supervisorservice-<VERSION>.yaml` with
 
 ## Air-gap transfer to a detached lab
 
-Two files move between machines. Minimize by using `imgpkg copy --to-tar` so
-bundle + operator image travel in a single tarball.
+Relocate the official, already-signed release from `ghcr.io` into the air-gapped registry, rather
+than rebuilding from source. This is what carries CI's provenance across the gap intact - both the
+always-on public signature and, if configured, the organization signature the Supervisor itself
+trusts. Two files cross the gap; the tar is the only large one, typically ~50 MB for a distroless
+Go operator.
 
-**On the build machine** (needs Docker + `imgpkg` + `kbld`; no access to the lab):
+`imgpkg copy` never carries a cosign signature unless `--cosign-signatures` is passed explicitly -
+omit it on either hop below and the destination bundle ends up silently unsigned, with no error.
+`make supervisor-offline-tar` and `make supervisor-offline-import` already pass it; the manual
+fallback commands do too.
+
+**On a machine with internet access to `ghcr.io`** (needs `imgpkg`; does not need Docker, `kbld`,
+or this repository checked out):
 
 ```sh
-# 1. Run a local registry so the bundle can be built without internet.
-docker run -d -p 5000:5000 --restart=always --name localreg registry:2
-
-# 2. Build and stage operator image + bundle locally.
-make supervisor-bundle VERSION=0.2.0 \
-    IMG=localhost:5000/vcf-salt-operator:0.2.0 \
-    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
-
-# 3. Emit the Service YAML (image path rewritten on the lab side).
-make supervisor-service-yaml VERSION=0.2.0 \
-    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
-
-# 4. Pack bundle + images into a single tar.
+# 1. Bundle + every image it references, packed into one tar, signatures included.
 make supervisor-offline-tar VERSION=0.2.0 \
-    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
+    BUNDLE_IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.2.0
+
+# 2. The upload-ready Service YAML for this version.
+make supervisor-service-yaml VERSION=0.2.0 \
+    BUNDLE_IMG=ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.2.0
 ```
 
-Transfer these three files to the lab (tar is the only large one, typically
-~50 MB for a distroless Go operator):
+Transfer these three files to the lab:
 
 - `dist/vcf-salt-operator-airgap-0.2.0.tar`
 - `dist/vcf-salt-operator-supervisorservice-0.2.0.yaml`
 - `config/supervisor-service/sample-values.yaml`
 
-**On the lab jump host** (needs `imgpkg` + access to Nexus + vSphere Client):
+**On the lab jump host** (needs `imgpkg` + access to Nexus/Harbor + vSphere Client):
 
 ```sh
 docker login nexus.corp
@@ -84,6 +84,7 @@ If the lab has no `make`, run the two underlying commands directly:
 ```sh
 imgpkg copy --tar vcf-salt-operator-airgap-0.2.0.tar \
     --to-repo nexus.corp/vcf/vcf-salt-operator-bundle \
+    --cosign-signatures \
     --lock-output bundle.lock.yml
 
 DIGEST=$(awk '/image:/{print $2; exit}' bundle.lock.yml)
@@ -91,13 +92,61 @@ sed -E -i.bak "/imgpkgBundle:/,/image:/ s|image:[[:space:]]+.*vcf-salt-operator-
     vcf-salt-operator-supervisorservice-0.2.0.yaml
 ```
 
-Then:
+### What survives the transfer, and how to check it
+
+The two signatures behave differently on the lab side, once nothing there can reach the internet:
+
+- The **organization signature** (if configured, see [Signing](#signing) above) is what the
+  Supervisor itself verifies at install time, and that check is fully offline - it walks the
+  certificate chain embedded in the signature and never touches the transparency log. It works
+  identically air-gapped or not. Nothing extra to do.
+- The **public keyless signature** crosses the gap the same way, but independently confirming it
+  with `cosign verify` from inside the air-gapped network needs a trust root staged in advance -
+  run `cosign initialize` once on a machine with internet access before the transfer and carry the
+  resulting root along with the other files, or `cosign verify --offline` has nothing to check
+  against on the lab side. Skip this if nobody in the lab needs to re-verify it independently - the
+  Supervisor's own install-time check doesn't consult it either way.
+
+Then, on the Supervisor:
 
 - Edit `sample-values.yaml`: set `image.repository` to
   `nexus.corp/vcf/vcf-salt-operator` and fill `imagePullSecret.dockerconfigjson`.
 - Upload `vcf-salt-operator-supervisorservice-0.2.0.yaml` via
   **Workload Management → Services → Add New Service**.
 - Install on the Supervisor and paste `sample-values.yaml`.
+
+### Building from source instead
+
+If the build machine can't reach `ghcr.io` even transiently, build the bundle from this
+repository's source rather than relocating the published release. The result is functionally
+equivalent but **independently built and unsigned** - nothing outside GitHub Actions can reproduce
+Sigstore's ephemeral Fulcio identity, so this path carries no signature of any kind until you add
+one yourself with `make supervisor-sign` (see [Signing](#signing) above) - before or after the
+transfer, either point works, since signing needs a certificate, not network access.
+
+**On the build machine** (needs Docker + `imgpkg` + `kbld`; no access to the lab):
+
+```sh
+# 1. Run a local registry so the bundle can be built without a real one.
+docker run -d -p 5000:5000 --restart=always --name localreg registry:2
+
+# 2. Build and stage operator image + bundle locally.
+make supervisor-bundle VERSION=0.2.0 \
+    IMG=localhost:5000/vcf-salt-operator:0.2.0 \
+    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
+
+# 3. Emit the Service YAML.
+make supervisor-service-yaml VERSION=0.2.0 \
+    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
+
+# 4. Pack bundle + images into a single tar. Nothing is signed yet, so
+#    --cosign-signatures has nothing to carry at this point.
+make supervisor-offline-tar VERSION=0.2.0 \
+    BUNDLE_IMG=localhost:5000/vcf-salt-operator-bundle:0.2.0
+```
+
+From here, transfer and import exactly as in the recommended path above, substituting these files
+for the `ghcr.io`-sourced ones.
 
 ## Relocate to a private registry (online)
 

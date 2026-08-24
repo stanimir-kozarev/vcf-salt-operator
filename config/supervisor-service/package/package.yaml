@@ -1,15 +1,16 @@
 ---
-# Versioned Package. `metadata.name` MUST be "<refName>.<version>".
-# The imgpkgBundle image reference is rewritten to an immutable digest by
-# `make supervisor-service-yaml` at release time.
+# Versioned Package. `metadata.name`/`spec.version` are templated at build time by
+# `make supervisor-service-yaml` (VERSION=...), same as the imgpkgBundle digest below -
+# never hand-edit the __VERSION__ placeholders or a released Package will carry a stale
+# version label even though its bundle digest is current.
 apiVersion: data.packaging.carvel.dev/v1alpha1
 kind: Package
 metadata:
-  name: vcf-salt-operator.salt.vcf.io.0.2.0
-  namespace: tkg-system
+  name: vcf-salt-operator.salt.vcf.io.__VERSION__
+  namespace: vmware-system-supervisor-services
 spec:
   refName: vcf-salt-operator.salt.vcf.io
-  version: 0.2.0
+  version: __VERSION__
   releaseNotes: |
     - VM reconvergence from terminal Failed/<step> states, triggered by an intent
       annotation change, a per-VM salt.vcf.io/retry-request, or a namespace-wide
@@ -18,6 +19,11 @@ spec:
       not only salt.vcf.io/roles
     - Scavenger CronJob defaults to --dry-run=true; a key with no correlated VM is
       logged at error level in both modes
+    - Package version/name and image tag default are now templated from VERSION at
+      build time instead of hand-maintained, and the default namespace matches the
+      one VCF9 actually activates Supervisor Service packages under
+    - Air-gap relocation (imgpkg copy) now carries cosign signatures across the hop
+      (--cosign-signatures); it was previously silently dropped
   valuesSchema:
     openAPIv3:
       title: vcf-salt-operator.salt.vcf.io values schema
@@ -37,7 +43,7 @@ spec:
               default: ghcr.io/stanimir-kozarev/vcf-salt-operator
             tag:
               type: string
-              default: "0.2.0"
+              default: "__VERSION__"
             pullPolicy:
               type: string
               default: IfNotPresent
@@ -89,7 +95,7 @@ spec:
       fetch:
       - imgpkgBundle:
           # Rewritten to an immutable digest by `make supervisor-service-yaml`.
-          image: ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:0.2.0
+          image: ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:__VERSION__
       template:
       - ytt:
           paths:

@@ -161,7 +161,7 @@ build-installer-vcf9: manifests generate kustomize ## Generate minimal install b
 ##@ Supervisor Service (VCF9)
 
 # Release version for the Supervisor Service bundle + Package.
-VERSION          ?= 0.2.0
+VERSION          ?= 0.2.2
 # Service ID — must match PackageMetadata.metadata.name in config/supervisor-service/package/.
 SERVICE_ID       ?= vcf-salt-operator.salt.vcf.io
 # OCI bundle published by `make supervisor-bundle`.
@@ -213,7 +213,7 @@ supervisor-service-yaml: ## Emit the upload-ready Supervisor Service YAML (Packa
 	{ \
 		cat $(SUPSVC_PKG_DIR)/package-metadata.yaml; \
 		echo; \
-		sed -E "s|image: ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:.*$$|image: $$digest|" \
+		sed -E "s|image: ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:.*$$|image: $$digest|; s|__VERSION__|$(VERSION)|g" \
 			$(SUPSVC_PKG_DIR)/package.yaml; \
 	} > $(SUPSVC_YAML_OUT)
 	@echo "Wrote $(SUPSVC_YAML_OUT)"
@@ -272,16 +272,16 @@ supervisor-relocate: ## Relocate bundle + referenced images to DEST_REPO (e.g. D
 		exit 2; \
 	fi
 	mkdir -p dist
-	imgpkg copy -b $(BUNDLE_IMG) --to-repo $(DEST_REPO) --lock-output dist/supervisor-bundle.lock.yml
+	imgpkg copy -b $(BUNDLE_IMG) --to-repo $(DEST_REPO) --cosign-signatures --lock-output dist/supervisor-bundle.lock.yml
 	@echo
-	@echo "Bundle + referenced images copied to $(DEST_REPO)."
+	@echo "Bundle + referenced images + cosign signatures copied to $(DEST_REPO)."
 	@echo "Next: make supervisor-service-yaml   # pins the Package at the Nexus digest"
 
 .PHONY: supervisor-offline-tar
 supervisor-offline-tar: ## Pack bundle + images into a single tar (dist/vcf-salt-operator-airgap-<VERSION>.tar) for transfer to an air-gapped lab. Source = BUNDLE_IMG.
 	@command -v imgpkg >/dev/null 2>&1 || { echo "imgpkg not found. Install Carvel imgpkg."; exit 1; }
 	mkdir -p dist
-	imgpkg copy -b $(BUNDLE_IMG) --to-tar dist/vcf-salt-operator-airgap-$(VERSION).tar
+	imgpkg copy -b $(BUNDLE_IMG) --to-tar dist/vcf-salt-operator-airgap-$(VERSION).tar --cosign-signatures
 	@echo
 	@ls -lh dist/vcf-salt-operator-airgap-$(VERSION).tar
 
@@ -296,7 +296,7 @@ supervisor-offline-import: ## On the lab side: upload a tar to DEST_REPO and pin
 		echo "           SERVICE_YAML=vcf-salt-operator-supervisorservice-0.2.0.yaml"; \
 		exit 2; \
 	fi
-	imgpkg copy --tar $(TAR) --to-repo $(DEST_REPO) --lock-output supervisor-bundle.lock.yml
+	imgpkg copy --tar $(TAR) --to-repo $(DEST_REPO) --cosign-signatures --lock-output supervisor-bundle.lock.yml
 	@digest="$$(awk '/image:/{print $$2; exit}' supervisor-bundle.lock.yml)"; \
 	echo "Pinning $(SERVICE_YAML) -> $$digest"; \
 	sed -E -i.bak "/imgpkgBundle:/,/image:/ s|image:[[:space:]]+.*vcf-salt-operator-bundle.*|image: $$digest|" $(SERVICE_YAML); \

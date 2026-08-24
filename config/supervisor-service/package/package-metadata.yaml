@@ -5,7 +5,7 @@ apiVersion: data.packaging.carvel.dev/v1alpha1
 kind: PackageMetadata
 metadata:
   name: vcf-salt-operator.salt.vcf.io
-  namespace: tkg-system
+  namespace: vmware-system-supervisor-services
 spec:
   displayName: "VCF Salt Operator"
   shortDescription: "Salt minion key lifecycle manager for VCF9 Supervisor"
