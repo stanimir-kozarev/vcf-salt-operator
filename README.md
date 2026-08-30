@@ -10,33 +10,7 @@ Day-2 role changes, and delete keys when VMs are destroyed.
 This operator is purpose-built for VCF9 Supervisor clusters. It is not a generic
 Kubernetes operator and does not support plain Kind or kubeadm clusters.
 
----
-
-## Release v0.2.0
-
-**VM reconvergence from failed states.** A VM in a terminal
-`salt.vcf.io/salt-status=Failed/<step>` state is recoverable, not stuck. The operator
-re-runs the Salt bootstrap chain (`test.ping → refresh_pillar → highstate`) from a
-failed state when any of three triggers fire: the VM's intent annotations change, a new
-`salt.vcf.io/retry-request` value is set on the VM, or a new
-`SaltKeyConfig.spec.retryToken` value retries every failed VM in the namespace at
-once. The operator never clears a trigger annotation itself, it only records what it
-acted on, which keeps this safe under continuous GitOps reconciliation.
-
-**Day-2 change detection covers the full intent-annotation set.** Change detection on
-a `Ready` VM covers every tenant-set `salt.vcf.io/*` annotation the operator does not
-itself write, not just `salt.vcf.io/roles`. A change to `cis-profile`, `environment`,
-`tag/*`, `cis-exceptions/*`, `vault-path`, or any future annotation of this kind
-triggers `refresh_pillar → highstate`. A VM with no roles configured is included as
-well, since the baseline configuration applies to every managed VM.
-
-**Safer key cleanup by default.** The Scavenger CronJob's `--dry-run` flag defaults
-to `true`: deleting a key requires passing `--dry-run=false` explicitly. A key with
-no correlated VM is logged at error level in both modes, so log-based alerting can
-catch the condition before a scheduled run deletes anything.
-
-See [Phase 3 — Ready, Day-2, and reconvergence](#phase-3--ready-day-2-and-reconvergence)
-and [Scavenger CronJob](#scavenger-cronjob) below for full details.
+Version history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -109,20 +83,26 @@ pushed by GitOps (e.g. ArgoCD updating an annotation) without polling — the
 annotation change itself generates the watch event. A VM with no roles configured is
 included, since the baseline configuration applies regardless of roles.
 
-A VM in a terminal `Failed/<step>` state reaches the same reconvergence check, not
-just `Ready` VMs. Besides an intent-hash change, two more triggers can pull a failed
-VM back into the bootstrap chain:
+Reconvergence is reached from `Ready` and from every terminal `Failed/<step>` state, and
+four things can trigger it. An intent-hash change, described above, applies to both. Two
+explicit triggers pull a failed VM back into the bootstrap chain:
 
 - `salt.vcf.io/retry-request` is set to a new value (any value different from
   `salt.vcf.io/retry-handled`, which the operator writes once it acts).
 - `SaltKeyConfig.spec.retryToken` is set to a new value, retrying every VM in the
   namespace currently in a `Failed/<step>` state.
 
-A retry reconvergence resets to the start of the chain (`test.ping` first) rather than
+The fourth is scheduled rather than event-driven: with
+`SaltKeyConfig.spec.enforcementInterval` set, a `Ready` VM whose last highstate is older
+than that interval re-runs the chain on its own. See
+[Scheduled enforcement](#scheduled-enforcement) for how the schedule is derived and why
+it never touches a failed VM.
+
+A reconvergence resets to the start of the chain (`test.ping` first) rather than
 resuming at the failed step, so a stale connection is re-verified before anything else
 runs. The operator never clears `retry-request` or `retryToken` itself, it only
 records what it last acted on in `salt.vcf.io/retry-handled` /
-`salt.vcf.io/bulk-retry-handled` — this is what makes the trigger safe to leave set
+`salt.vcf.io/bulk-retry-handled` - this is what makes the trigger safe to leave set
 in Git under continuous GitOps reconciliation.
 
 ### VM deletion
@@ -204,6 +184,7 @@ spec:
   acceptTimeout: "10m"                  # How long to wait for a pending key before marking Failed
   requeueInterval: "30s"               # How often to re-check for pending keys
   retryToken: ""                        # Any new value retries every Failed/<step> VM in this namespace
+  enforcementInterval: ""               # e.g. "24h". Re-runs a Ready VM whose last highstate is older. Empty disables
 ```
 
 The `SaltKeyConfigReconciler` validates the referenced Secret and sets
@@ -728,6 +709,38 @@ will show:
 ```
 Reconvergence triggered from a terminal state, resetting the Salt chain   minionID=<vm-name>  from=Failed/Highstate
 ```
+
+---
+
+## Scheduled enforcement
+
+The bootstrap chain and Day-2 detection are both event-driven: a VM converges when it is
+created and whenever its intent changes. Nothing re-checks it in between, so
+configuration changed in-guest after the last highstate stays changed until something
+else happens to trigger a run.
+
+`SaltKeyConfig.spec.enforcementInterval` closes that window. Set it to a duration
+(for example `"24h"`) and a VM reporting `salt-status=Ready` whose last highstate
+completed longer ago than that interval re-runs `refresh_pillar -> highstate`,
+re-asserting the configuration Git describes. It is unset by default, so enforcement
+stays purely event-driven until you opt in and upgrading changes nothing for an existing
+deployment.
+
+The schedule is derived per VM rather than shared. Each VM's interval is measured from
+its own `salt.vcf.io/highstate-time`, so VMs that bootstrapped at different moments come
+due at different moments and the load spreads itself across the estate without batching
+or rate limiting. VMs onboarded together in one batch would otherwise stay in lockstep,
+so a jitter of up to a tenth of the interval is added, derived from the VM's UID and
+therefore stable across reconciles and operator restarts rather than drifting on each
+evaluation.
+
+Enforcement applies only to VMs reporting `salt-status=Ready`. A VM in a terminal
+`Failed/<step>` state is never picked up by the interval, which preserves the rule that
+a broken VM stays visibly broken until something explicitly retries it rather than
+looping against a failure nobody has looked at.
+
+A malformed duration is rejected by the CRD at admission, so a typo is a failed apply
+rather than enforcement that silently never runs.
 
 ---
 

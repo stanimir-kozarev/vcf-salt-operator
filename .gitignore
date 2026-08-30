@@ -32,9 +32,10 @@ go.work
 /raas-test
 cmd/raas-test/
 
-# Markdown files (except README.md)
+# Markdown files (except the ones that document the project itself)
 *.md
 !README.md
+!CHANGELOG.md
 
 # Generated install manifests
 dist/
