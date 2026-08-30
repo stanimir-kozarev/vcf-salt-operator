@@ -9,6 +9,7 @@ package controller
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"maps"
@@ -61,6 +62,11 @@ const intentHashVersion = "v2:"
 // failedStatusPrefix marks the terminal Failed/<step> states. checkReconvergence is the
 // only way out of one.
 const failedStatusPrefix = "Failed/"
+
+// saltStatusReady is the AnnotationSaltStatus value for a VM whose last highstate completed
+// successfully. Scheduled enforcement matches on it exactly rather than on "not failed", so
+// a VM in any other state is left alone instead of being swept up by the interval.
+const saltStatusReady = "Ready"
 
 // Salt annotation keys written by this operator onto VirtualMachine resources.
 const (
@@ -720,11 +726,30 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 	// for an unrelated reason.
 	if !intentChanged && !retryRequested && (!bulkChanged || !failed) {
 		if bulkChanged {
-			return ctrl.Result{}, r.patchAnnotations(ctx, vm, map[string]string{
+			if err := r.patchAnnotations(ctx, vm, map[string]string{
 				AnnotationBulkRetryHandled: bulkToken,
-			})
+			}); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
-		return ctrl.Result{}, nil
+
+		// No explicit trigger fired. Scheduled enforcement is the only remaining reason to
+		// act, and it applies to Ready VMs alone: a terminal Failed/<step> VM is left where
+		// it is, so the no-automatic-retry rule in this function's doc comment still holds.
+		// Anything else (mid-chain, unknown status) is also left alone.
+		if annotations[AnnotationSaltStatus] != saltStatusReady {
+			return ctrl.Result{}, nil
+		}
+		due, wait := enforcementDue(cfg, string(vm.GetUID()), annotations[AnnotationHighstateTime], time.Now().UTC())
+		if !due {
+			// wait == 0 means enforcement is disabled or not evaluable, so the VM goes
+			// dormant exactly as it did before this feature existed.
+			return ctrl.Result{RequeueAfter: wait}, nil
+		}
+		log.Info("Scheduled enforcement due, re-running refresh_pillar + highstate",
+			"name", vm.GetName(), "minionID", minionID,
+			"lastHighstate", annotations[AnnotationHighstateTime],
+			"interval", cfg.Spec.EnforcementInterval)
 	}
 
 	// Reset to the start of the chain rather than resuming at the failed step: ping proves
@@ -1075,6 +1100,59 @@ func (r *VirtualMachineReconciler) patchAnnotations(
 	maps.Copy(annotations, additions)
 	vm.SetAnnotations(annotations)
 	return r.Patch(ctx, vm, patch)
+}
+
+// enforcementDue reports whether scheduled enforcement should re-run the Salt chain now,
+// and when the VM should next be re-examined if it should not.
+//
+// A zero wait alongside due=false means "never, on this configuration": enforcement is
+// switched off, or there is no completed highstate to measure from. The caller requeues on
+// the returned wait, and a zero value leaves the VM dormant, which is exactly the behaviour
+// that existed before scheduled enforcement.
+//
+// The interval is measured from the VM's own last highstate rather than from a shared
+// schedule, so VMs bootstrapped at different times come due at different times with no
+// pacing machinery. enforcementJitter spreads the remaining case, VMs onboarded together.
+func enforcementDue(cfg *saltv1alpha1.SaltKeyConfig, uid, lastHighstate string, now time.Time) (bool, time.Duration) {
+	if cfg == nil || cfg.Spec.EnforcementInterval == "" {
+		return false, 0
+	}
+	interval, err := time.ParseDuration(cfg.Spec.EnforcementInterval)
+	if err != nil || interval <= 0 {
+		// The CRD pattern rejects malformed values at admission, so reaching here means a
+		// value that parsed as well-formed but is unusable. Disable rather than guess.
+		return false, 0
+	}
+	if lastHighstate == "" {
+		return false, 0
+	}
+	last, err := time.Parse(time.RFC3339, lastHighstate)
+	if err != nil {
+		return false, 0
+	}
+
+	elapsed := now.Sub(last)
+	effective := interval + enforcementJitter(uid, interval)
+	if elapsed >= effective {
+		return true, 0
+	}
+	return false, effective - elapsed
+}
+
+// enforcementJitter returns a stable per-VM offset in [0, interval/10), derived from the
+// VM's UID. Stable rather than random so a VM keeps the same slot across reconciles and
+// across operator restarts, instead of drifting every time it is evaluated.
+//
+// Without it, VMs onboarded in one batch share a bootstrap time and would stay in lockstep
+// for as long as they exist, reproducing the thundering herd that measuring from each VM's
+// own last highstate otherwise avoids.
+func enforcementJitter(uid string, interval time.Duration) time.Duration {
+	spread := interval / 10
+	if spread <= 0 || uid == "" {
+		return 0
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return time.Duration(binary.BigEndian.Uint64(sum[:8]) % uint64(spread))
 }
 
 // parseDurationOrDefault parses a Go duration string (e.g. "10m", "30s").

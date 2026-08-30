@@ -77,6 +77,27 @@ type SaltKeyConfigSpec struct {
 	// annotation, which a team sets on its own manifest.
 	// +optional
 	RetryToken string `json:"retryToken,omitempty"`
+
+	// enforcementInterval re-runs the Salt chain for VirtualMachines in this namespace whose
+	// last highstate completed longer ago than this duration, correcting configuration that
+	// drifted outside Git between events. Example: "24h".
+	//
+	// Empty or absent disables scheduled enforcement, which is the default. Enforcement stays
+	// purely event-driven until an operator opts in, so adding this field to the API changes
+	// no existing deployment's behaviour.
+	//
+	// Only VMs reporting salt.vcf.io/salt-status=Ready are re-run. A VM sitting in a terminal
+	// Failed/<step> state is never picked up here, which preserves the no-automatic-retry rule
+	// the controller applies elsewhere: a broken VM stays visibly broken until something
+	// triggers it explicitly, rather than looping against a failure nobody has looked at.
+	//
+	// Due times spread themselves across the estate without any pacing machinery, since each
+	// VM's interval is measured from its own last highstate and VMs bootstrap at different
+	// moments. A small per-VM jitter is added on top so that VMs onboarded in one batch do not
+	// stay in lockstep forever.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|ms|s|m|h))+$`
+	EnforcementInterval string `json:"enforcementInterval,omitempty"`
 }
 
 // SaltKeyConfigStatus defines the observed state of SaltKeyConfig.

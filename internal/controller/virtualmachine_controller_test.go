@@ -785,6 +785,124 @@ var _ = Describe("VirtualMachine Controller", func() {
 			Expect(updated[AnnotationSaltStatus]).To(Equal("HighstateDispatched"))
 			Expect(updated[AnnotationRetryHandled]).To(Equal("CHG0042000"))
 		})
+
+		// Scheduled enforcement (finding D). The interval corrects drift introduced outside
+		// Git between events. The tests that matter most here are the ones asserting it does
+		// NOT fire: enabled by accident, it would dispatch a highstate against every Ready VM
+		// in every enrolled namespace.
+		Describe("Scheduled enforcement", func() {
+			setEnforcementInterval := func(interval string) {
+				GinkgoHelper()
+				cfg := &saltv1alpha1.SaltKeyConfig{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "salt-config", Namespace: saltCfgNS}, cfg)).To(Succeed())
+				original := cfg.DeepCopy()
+				cfg.Spec.EnforcementInterval = interval
+				Expect(k8sClient.Patch(ctx, cfg, client.MergeFrom(original))).To(Succeed())
+			}
+
+			// makeReadyVM builds a settled, healthy VM whose last highstate completed
+			// lastHighstateAge ago.
+			makeReadyVM := func(lastHighstateAge time.Duration) *unstructured.Unstructured {
+				GinkgoHelper()
+				state := map[string]string{AnnotationRoles: "web_server"}
+				annotations := mergeAnnotations(map[string]string{
+					AnnotationManaged:         "true",
+					AnnotationKeyStatus:       "Accepted",
+					AnnotationMinionID:        vmName,
+					AnnotationSaltStatus:      "Ready",
+					AnnotationReady:           "true",
+					AnnotationHighstateStatus: "Success",
+					AnnotationHighstateTime: time.Now().UTC().
+						Add(-lastHighstateAge).Format(time.RFC3339),
+				}, state)
+				annotations[AnnotationRolesHash] = computeIntentHash(
+					mergeAnnotations(map[string]string{AnnotationManaged: "true"}, state))
+				vm := makeVM(vmName, saltCfgNS, annotations)
+				vm.SetFinalizers([]string{saltFinalizer})
+				return vm
+			}
+
+			It("should never fire on a VM stranded in a terminal Failed state", func() {
+				// The single most important property. checkReconvergence deliberately refuses
+				// automatic retries so a broken VM stays visibly broken instead of looping
+				// against a failure nobody has looked at. An interval that swept up Failed
+				// VMs would silently undo that.
+				setEnforcementInterval("1s")
+				state := map[string]string{AnnotationRoles: "web_server"}
+				vm := makeFailedVM("Failed/Highstate", state, mergeAnnotations(state, map[string]string{
+					AnnotationHighstateTime: time.Now().UTC().Add(-72 * time.Hour).Format(time.RFC3339),
+				}))
+				Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+				_, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getVM().GetAnnotations()[AnnotationSaltStatus]).To(Equal("Failed/Highstate"),
+					"scheduled enforcement must leave terminal failures alone, not auto-retry them")
+			})
+
+			It("should not fire when no interval is configured", func() {
+				// Every SaltKeyConfig that predates this field lands here. Behaviour must be
+				// identical to before the feature existed.
+				vm := makeReadyVM(365 * 24 * time.Hour)
+				Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+				result, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getVM().GetAnnotations()[AnnotationSaltStatus]).To(Equal("Ready"),
+					"a VM with no enforcementInterval must stay dormant regardless of how old its last highstate is")
+				Expect(result.RequeueAfter).To(BeZero(),
+					"and must not be requeued, or the operator would poll every Ready VM forever for nothing")
+			})
+
+			It("should not fire before the interval has elapsed, and should requeue", func() {
+				setEnforcementInterval("24h")
+				vm := makeReadyVM(time.Hour)
+				Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+				result, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(getVM().GetAnnotations()[AnnotationSaltStatus]).To(Equal("Ready"))
+				Expect(result.RequeueAfter).To(BeNumerically(">", 22*time.Hour),
+					"a VM not yet due must come back on its own when it is")
+			})
+
+			It("should reject a malformed interval at the API rather than silently disabling it", func() {
+				// enforcementDue treats an unparseable value as "disabled", which is the safe
+				// reading but a silent one. The CRD pattern is what makes the mistake visible
+				// to whoever wrote it, so a typo is a rejected apply rather than enforcement
+				// that quietly never runs.
+				cfg := &saltv1alpha1.SaltKeyConfig{
+					ObjectMeta: metav1.ObjectMeta{Name: "bad-interval", Namespace: saltCfgNS},
+					Spec: saltv1alpha1.SaltKeyConfigSpec{
+						RaasURL:             "https://aria-config.test:443",
+						CredentialsSecret:   "salt-raas-creds",
+						MasterID:            "test-master",
+						EnforcementInterval: "24 hours",
+					},
+				}
+				err := k8sClient.Create(ctx, cfg)
+				Expect(err).To(HaveOccurred(), "a malformed duration must not reach the controller at all")
+				Expect(err.Error()).To(ContainSubstring("enforcementInterval"))
+			})
+
+			It("should re-run the chain once the interval has elapsed", func() {
+				setEnforcementInterval("24h")
+				vm := makeReadyVM(48 * time.Hour)
+				Expect(k8sClient.Create(ctx, vm)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, vm) })
+
+				_, err := reconciler.Reconcile(ctx, req)
+				Expect(err).NotTo(HaveOccurred())
+
+				updated := getVM().GetAnnotations()
+				Expect(updated[AnnotationSaltStatus]).To(Equal("HighstateDispatched"),
+					"an overdue Ready VM must re-run the full chain, not just be marked")
+				Expect(updated[AnnotationHighstateStatus]).To(Equal("InProgress"))
+			})
+		})
 	})
 
 	Context("Intent hash format migration", func() {
