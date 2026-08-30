@@ -28,7 +28,9 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
-raas-test
+
+/raas-test
+cmd/raas-test/
 
 # Markdown files (except README.md)
 *.md
