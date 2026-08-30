@@ -43,3 +43,6 @@ config/supervisor-service/bundle/config/002-crd.yaml
 config/supervisor-service/bundle/config/zz-build-values.yaml
 
 docs/*
+
+# macOS Finder metadata
+.DS_Store
