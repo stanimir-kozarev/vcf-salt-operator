@@ -8,7 +8,7 @@ Entries are named after the feature they introduced, using the same names the
 [README](README.md) uses for its sections, so a capability can be traced from how it
 works to when it shipped.
 
-## Unreleased
+## v0.3.1 - 2026-09-14
 
 ### Changed
 
