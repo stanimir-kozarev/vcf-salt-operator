@@ -785,10 +785,12 @@ configuration.
 
 ## License
 
-Copyright (c) 2025 Stan Kozarev. Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT No Attribution License (MIT-0)](LICENSE).
+No attribution is required: use, modify, redistribute or rebrand this code freely, with no
+obligation to the author and no warranty from the author.
 
 ## Disclaimer
 
 This operator interfaces with VMware VCF Salt via its public REST API. VCF Salt and
-its API are governed by VMware/Broadcom's licensing terms, not by this MIT-licensed
+its API are governed by VMware/Broadcom's licensing terms, not by this MIT-0 licensed
 code. This project is not affiliated with or endorsed by VMware or Broadcom.

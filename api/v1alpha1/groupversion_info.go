@@ -1,7 +1,5 @@
 /*
-Copyright (c) 2025 Stan Kozarev.
-
-SPDX-License-Identifier: MIT
+SPDX-License-Identifier: MIT-0
 */
 
 // Package v1alpha1 contains API Schema definitions for the salt v1alpha1 API group.

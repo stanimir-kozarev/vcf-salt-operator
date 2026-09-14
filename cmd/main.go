@@ -1,7 +1,5 @@
 /*
-Copyright (c) 2025 Stan Kozarev.
-
-SPDX-License-Identifier: MIT
+SPDX-License-Identifier: MIT-0
 */
 
 package main

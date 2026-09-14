@@ -1,7 +1,5 @@
 /*
-Copyright (c) 2025 Stan Kozarev.
-
-SPDX-License-Identifier: MIT
+SPDX-License-Identifier: MIT-0
 */
 
 // cmd/scavenger is a one-shot job intended to run as a Kubernetes CronJob. It reconciles

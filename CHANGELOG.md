@@ -8,6 +8,16 @@ Entries are named after the feature they introduced, using the same names the
 [README](README.md) uses for its sections, so a capability can be traced from how it
 works to when it shipped.
 
+## Unreleased
+
+### Changed
+
+- **License.** Relicensed from MIT to MIT No Attribution (MIT-0). The only condition MIT
+  imposed, retaining the copyright notice in copies, is removed. Anyone may use, modify,
+  redistribute or rebrand this code with no attribution and no obligation of any kind.
+  The warranty and liability disclaimer is unchanged. Releases up to and including v0.3.0
+  remain available under their original MIT terms.
+
 ## v0.3.0 - 2026-08-30
 
 ### Added
