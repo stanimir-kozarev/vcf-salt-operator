@@ -11,7 +11,6 @@ import (
 	saltv1alpha1 "github.com/stanimir-kozarev/vcf-salt-operator/api/v1alpha1"
 )
 
-// cfgWithInterval builds the minimum SaltKeyConfig enforcementDue reads.
 func cfgWithInterval(interval string) *saltv1alpha1.SaltKeyConfig {
 	return &saltv1alpha1.SaltKeyConfig{
 		Spec: saltv1alpha1.SaltKeyConfigSpec{EnforcementInterval: interval},
@@ -20,21 +19,12 @@ func cfgWithInterval(interval string) *saltv1alpha1.SaltKeyConfig {
 
 const testUID = "8f14e45f-ea8f-4b9a-9c1e-2f5b7d3a6c04"
 
-// rfc3339Ago renders a timestamp d in the past, in the format the operator writes to
-// AnnotationHighstateTime.
 func rfc3339Ago(now time.Time, d time.Duration) string {
 	return now.Add(-d).UTC().Format(time.RFC3339)
 }
 
-// TestEnforcementDue_DisabledWhenUnset is the case that matters most for an existing
-// deployment: a SaltKeyConfig that predates this field must behave exactly as it did
-// before, dormant and never re-run on a timer. A regression here would silently start
-// dispatching highstates across every enrolled namespace, which is why this is the first
-// test rather than an afterthought to the happy path.
 func TestEnforcementDue_DisabledWhenUnset(t *testing.T) {
 	now := time.Now().UTC()
-	// A last highstate far older than any plausible interval: if the feature were
-	// accidentally enabled by default, this input would certainly trigger it.
 	last := rfc3339Ago(now, 365*24*time.Hour)
 
 	for _, tc := range []struct {
@@ -56,10 +46,6 @@ func TestEnforcementDue_DisabledWhenUnset(t *testing.T) {
 	}
 }
 
-// TestEnforcementDue_NotYetDue covers the ordinary in-between case: configured, but the
-// interval has not elapsed. The VM must not run, and must be requeued for roughly the
-// remaining time rather than dropped (which would leave it dormant until an unrelated
-// event woke it).
 func TestEnforcementDue_NotYetDue(t *testing.T) {
 	now := time.Now().UTC()
 	last := rfc3339Ago(now, time.Hour)
@@ -71,16 +57,13 @@ func TestEnforcementDue_NotYetDue(t *testing.T) {
 	if wait <= 0 {
 		t.Fatalf("wait = %v, want a positive requeue so the VM is re-examined when it comes due", wait)
 	}
-	// 23h remaining, plus this VM's jitter, which is bounded by interval/10.
 	if wait < 23*time.Hour || wait > 23*time.Hour+(24*time.Hour/10) {
 		t.Fatalf("wait = %v, want ~23h plus jitter under 2h24m", wait)
 	}
 }
 
-// TestEnforcementDue_FiresOnceElapsed is the positive case.
 func TestEnforcementDue_FiresOnceElapsed(t *testing.T) {
 	now := time.Now().UTC()
-	// Well past the interval and its maximum jitter, so this is unambiguously due.
 	last := rfc3339Ago(now, 48*time.Hour)
 
 	due, wait := enforcementDue(cfgWithInterval("24h"), testUID, last, now)
@@ -92,9 +75,6 @@ func TestEnforcementDue_FiresOnceElapsed(t *testing.T) {
 	}
 }
 
-// TestEnforcementDue_NoCompletedHighstate guards the fail-quiet direction. A VM with no
-// recorded highstate time has nothing to measure from, and the safe answer is to do
-// nothing rather than to treat "no timestamp" as "infinitely overdue" and dispatch.
 func TestEnforcementDue_NoCompletedHighstate(t *testing.T) {
 	now := time.Now().UTC()
 
@@ -115,9 +95,6 @@ func TestEnforcementDue_NoCompletedHighstate(t *testing.T) {
 	}
 }
 
-// TestEnforcementDue_RejectsUnusableInterval covers values that parse as durations but
-// cannot schedule anything. Disabling is the safe reading: a zero or negative interval
-// read as "always due" would put every Ready VM into a dispatch loop.
 func TestEnforcementDue_RejectsUnusableInterval(t *testing.T) {
 	now := time.Now().UTC()
 	last := rfc3339Ago(now, 365*24*time.Hour)
@@ -135,9 +112,6 @@ func TestEnforcementDue_RejectsUnusableInterval(t *testing.T) {
 	}
 }
 
-// TestEnforcementJitter_StableAndBounded asserts the two properties the jitter exists for.
-// Stability matters because an unstable offset would move a VM's due time on every
-// reconcile, so it could either never come due or come due repeatedly.
 func TestEnforcementJitter_StableAndBounded(t *testing.T) {
 	const interval = 24 * time.Hour
 	maxJitter := interval / 10
@@ -153,9 +127,6 @@ func TestEnforcementJitter_StableAndBounded(t *testing.T) {
 	}
 }
 
-// TestEnforcementJitter_SpreadsAcrossVMs is the property that replaces a pacing subsystem:
-// VMs onboarded in one batch share a bootstrap time, so without distinct jitter they would
-// stay in lockstep and come due together forever.
 func TestEnforcementJitter_SpreadsAcrossVMs(t *testing.T) {
 	const interval = 24 * time.Hour
 
@@ -174,9 +145,6 @@ func TestEnforcementJitter_SpreadsAcrossVMs(t *testing.T) {
 	}
 }
 
-// TestEnforcementJitter_ZeroWhenUnusable keeps the helper total: a missing UID or an
-// interval too small to divide must degrade to no jitter rather than panic on a modulo by
-// zero.
 func TestEnforcementJitter_ZeroWhenUnusable(t *testing.T) {
 	if got := enforcementJitter("", 24*time.Hour); got != 0 {
 		t.Fatalf("jitter with no UID = %v, want 0", got)

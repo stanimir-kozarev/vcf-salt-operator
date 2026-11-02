@@ -1,0 +1,11 @@
+#@ load("@ytt:data", "data")
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vcf-salt-operator-ready
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+data:
+  ready: "true"

@@ -9,8 +9,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,146 +22,105 @@ import (
 	"github.com/go-logr/logr"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	saltv1alpha1 "github.com/stanimir-kozarev/vcf-salt-operator/api/v1alpha1"
+	"github.com/stanimir-kozarev/vcf-salt-operator/internal/raasconn"
 	"github.com/stanimir-kozarev/vcf-salt-operator/pkg/salt"
 )
 
-// saltFinalizer is added to VMs once their key is accepted, ensuring reconcileDelete
-// runs before the object is removed from the API server.
 const saltFinalizer = "salt.vcf.io/cleanup"
 
-// postAcceptStepTimeout is the context deadline for blocking Salt operations (ping, pillar refresh).
 const postAcceptStepTimeout = 2 * time.Minute
 
-// postAcceptDelay is the grace period after key acceptance before the first test.ping.
-// Gives the salt-minion time to re-establish its ZeroMQ connection to the master
-// before the operator dispatches commands.
+var minMasterSilence = time.Minute
+
+const eventMasterSilent = "SaltMasterSilent"
+
 const postAcceptDelay = 30 * time.Second
 
-// maxBootstrapDuration caps the total window in which transient ping/pillar-refresh
-// failures are retried automatically. After this window expires, the failure is
-// terminal and requires operator intervention.
 const maxBootstrapDuration = 10 * time.Minute
 
-// intentHashVersion prefixes every digest computeIntentHash produces, so a legacy-format
-// hash (no prefix) is distinguishable from a current one. See adoptLegacyIntentHash.
 const intentHashVersion = "v2:"
 
-// failedStatusPrefix marks the terminal Failed/<step> states. checkReconvergence is the
-// only way out of one.
 const failedStatusPrefix = "Failed/"
 
-// saltStatusReady is the AnnotationSaltStatus value for a VM whose last highstate completed
-// successfully. Scheduled enforcement matches on it exactly rather than on "not failed", so
-// a VM in any other state is left alone instead of being swept up by the interval.
 const saltStatusReady = "Ready"
 
-// Salt annotation keys written by this operator onto VirtualMachine resources.
+const saltStatusHighstateDispatched = "HighstateDispatched"
+
 const (
-	// AnnotationManaged opts a VirtualMachine into Salt key management.
-	// Namespace owner sets this to "true" on the VM spec.
+	keyStatusAccepted     = "Accepted"
+	keyStatusFailed       = "Failed"
+	keyStatusDeleted      = "Deleted"
+	keyStatusPreseeded    = "Preseeded"
+	matchMethodPreseed    = "preseed"
+	bootstrapSecretSuffix = "-salt-bootstrap"
+	bootstrapKeyCleared   = "cleared"
+	guestSignalKey        = "salt-key-written"
+)
+
+const (
+	annotationTrue  = "true"
+	annotationFalse = "false"
+)
+
+const (
 	AnnotationManaged = "salt.vcf.io/managed"
 
-	// AnnotationKeyStatus is the key-acceptance lifecycle state.
-	// Values: Accepted | Failed | Deleted | DeleteFailed
 	AnnotationKeyStatus = "salt.vcf.io/key-status"
 
-	// AnnotationMinionID records which Salt minion ID was matched and accepted.
 	AnnotationMinionID = "salt.vcf.io/minion-id"
 
-	// AnnotationMatchMethod records which matching strategy was used.
 	AnnotationMatchMethod = "salt.vcf.io/match-method"
 
-	// AnnotationSaltStatus is the post-accept Salt management phase.
-	// Values: Pinged | PillarRefreshed | HighstateDispatched | Ready | Failed/<step>
 	AnnotationSaltStatus = "salt.vcf.io/salt-status"
 
-	// AnnotationReady reflects whether Salt management is complete and successful.
-	// Values: "true" | "false"
 	AnnotationReady = "salt.vcf.io/ready"
 
-	// AnnotationHighstateJID is the JID of the currently running (or last completed) highstate.
 	AnnotationHighstateJID = "salt.vcf.io/highstate-jid"
 
-	// AnnotationHighstateStatus is the outcome of the last highstate execution.
-	// Values: InProgress | Success | Failed
 	AnnotationHighstateStatus = "salt.vcf.io/highstate-status"
 
-	// AnnotationHighstateTime is the RFC3339 timestamp of the last highstate completion.
 	AnnotationHighstateTime = "salt.vcf.io/highstate-time"
 
-	// AnnotationRoles is the roles list set by Argo CD (observed, never written by the operator).
-	// The operator watches this annotation for Day-2 change detection.
 	AnnotationRoles = "salt.vcf.io/roles"
 
-	// AnnotationRolesHash is the SHA256 hash of the full tenant-declared intent-annotation
-	// set (every salt.vcf.io/* key except the operator's own status keys, see
-	// operatorStatusAnnotations) at the time of the last highstate dispatch. A mismatch
-	// triggers a Day-2 refresh_pillar + highstate cycle. Kept under its original name (this
-	// used to hash AnnotationRoles alone, see computeIntentHash's doc comment) since it is
-	// already part of the documented intent-vs-status annotation split app teams rely on.
 	AnnotationRolesHash = "salt.vcf.io/roles-hash"
 
-	// AnnotationAcceptedAt is the RFC3339 timestamp when the Salt key was accepted.
-	// Used to enforce postAcceptDelay before the first test.ping and to bound the
-	// total retry window (maxBootstrapDuration) for transient ping/pillar failures.
 	AnnotationAcceptedAt = "salt.vcf.io/accepted-at"
 
-	// AnnotationHighstateFailedCount is the number of failed states in the last highstate.
-	// "0" means all states succeeded. Safe to expose to app teams (no secret values).
+	AnnotationKeyCleared = "salt.vcf.io/key-cleared"
+
 	AnnotationHighstateFailedCount = "salt.vcf.io/highstate-failed-count"
 
-	// AnnotationHighstateFailedStates is a comma-separated list of failed state IDs from
-	// the last highstate run. Contains only state map keys, never rendered values or secrets.
 	AnnotationHighstateFailedStates = "salt.vcf.io/highstate-failed-states"
 
-	// AnnotationRetryRequest is a tenant-set, Git-delivered trigger asking the operator to
-	// re-run the Salt chain. An opaque token compared against AnnotationRetryHandled: any
-	// change requests one re-run.
-	//
-	// The operator never clears this annotation, only records what it acted on. Clearing it
-	// would fight Argo CD's selfHeal, since the Git-asserted value would never be satisfied.
 	AnnotationRetryRequest = "salt.vcf.io/retry-request"
 
-	// AnnotationRetryHandled records the AnnotationRetryRequest value the operator last
-	// acted on. An annotation, not a status field, because this operator does not own the
-	// VirtualMachine CRD.
 	AnnotationRetryHandled = "salt.vcf.io/retry-handled"
 
-	// AnnotationBulkRetryHandled records the SaltKeyConfig.spec.retryToken value this VM
-	// last acted on. Held per VM, not once on the SaltKeyConfig, since a single shared
-	// record would race: the first VM to reconcile would mark the token consumed for every
-	// other VM in the namespace.
 	AnnotationBulkRetryHandled = "salt.vcf.io/bulk-retry-handled"
 )
 
-// nonIntentAnnotations is the set of salt.vcf.io/* keys excluded from the intent hash.
-// A deny-list, not an allow-list, so a new tenant annotation is picked up for Day-2 change
-// detection automatically, with no code change.
-//
-// Two reasons for exclusion:
-//   - Operator-written status: including these would make the operator's own writes look
-//     like tenant intent, and every completed highstate would re-trigger itself.
-//   - Operational triggers: AnnotationRetryRequest is tenant-written like an intent
-//     annotation, but requests an action rather than describing desired configuration, so
-//     it is handled explicitly in checkReconvergence instead.
-//
-// AnnotationManaged and AnnotationRoles are deliberately absent - both are tenant-declared
-// configuration, so both belong in the hash.
 var nonIntentAnnotations = map[string]bool{
-	// Operator-written status
 	AnnotationKeyStatus:             true,
 	AnnotationMinionID:              true,
 	AnnotationMatchMethod:           true,
@@ -170,34 +131,25 @@ var nonIntentAnnotations = map[string]bool{
 	AnnotationHighstateTime:         true,
 	AnnotationRolesHash:             true,
 	AnnotationAcceptedAt:            true,
+	AnnotationKeyCleared:            true,
 	AnnotationHighstateFailedCount:  true,
 	AnnotationHighstateFailedStates: true,
 	AnnotationRetryHandled:          true,
 	AnnotationBulkRetryHandled:      true,
 
-	// Operational triggers
 	AnnotationRetryRequest: true,
 }
 
-// virtualMachineGVK is the GroupVersionKind for the VM Service VirtualMachine resource.
-// Using unstructured avoids a Go dependency on the vmoperator types package.
 var virtualMachineGVK = schema.GroupVersionKind{
 	Group:   "vmoperator.vmware.com",
 	Version: "v1alpha4",
 	Kind:    "VirtualMachine",
 }
 
-// SaltClientFactory creates a salt.Client from connection parameters.
-// Injected at startup (uses salt.NewRaaSClient); replaced with a mock in tests.
-// log is forwarded to the client for V(1) debug output; pass logr.Discard() to suppress.
 type SaltClientFactory func(raasURL, username, password, masterID string, skipTLS bool, log logr.Logger) salt.Client
 
-// saltClientCacheTTL is the maximum lifetime of a cached logged-in client.
-// Shorter than a typical JWT lifetime, but avoids a re-login on every reconcile.
 const saltClientCacheTTL = 20 * time.Minute
 
-// saltClientCache is a thread-safe cache of logged-in RaaS clients, keyed by SaltKeyConfig.
-// Entries are invalidated when the config ResourceVersion changes or the TTL expires.
 type saltClientCache struct {
 	mu      sync.Mutex
 	entries map[types.NamespacedName]saltCacheEntry
@@ -233,18 +185,16 @@ func (c *saltClientCache) set(key types.NamespacedName, configRV string, cl salt
 	}
 }
 
-// VirtualMachineReconciler watches VirtualMachine resources cluster-wide and manages
-// Salt minion key acceptance/deletion for VMs that opt in via annotation.
 type VirtualMachineReconciler struct {
 	client.Client
 	SaltClientFactory       SaltClientFactory
 	Recorder                record.EventRecorder
+	DefaultConnection       raasconn.Default
 	MaxConcurrentReconciles int
 	cacheOnce               sync.Once
 	saltCache               *saltClientCache
 }
 
-// getCache returns the reconciler's shared client cache, initialising it on first call.
 func (r *VirtualMachineReconciler) getCache() *saltClientCache {
 	r.cacheOnce.Do(func() {
 		r.saltCache = &saltClientCache{entries: make(map[types.NamespacedName]saltCacheEntry)}
@@ -256,10 +206,8 @@ func (r *VirtualMachineReconciler) getCache() *saltClientCache {
 // +kubebuilder:rbac:groups=vmoperator.vmware.com,resources=virtualmachines/status,verbs=get
 // +kubebuilder:rbac:groups=salt.vcf.io,resources=saltkeyconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=create;update;patch
 
-// Reconcile is called on every VirtualMachine create/update/delete event.
-// It routes to the delete flow when DeletionTimestamp is set, and the create/accept
-// flow otherwise.
 func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -269,12 +217,10 @@ func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Only manage VMs that opted in
-	if vm.GetAnnotations()[AnnotationManaged] != "true" {
+	if vm.GetAnnotations()[AnnotationManaged] != annotationTrue {
 		return ctrl.Result{}, nil
 	}
 
-	// Only manage VMs in enrolled namespaces
 	saltConfig, err := r.findSaltKeyConfig(ctx, req.Namespace)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -289,16 +235,16 @@ func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"saltConfig", saltConfig.Name,
 	)
 
-	// Route: delete flow vs create/accept flow
 	if !vm.GetDeletionTimestamp().IsZero() {
 		return r.reconcileDelete(ctx, vm, saltConfig)
+	}
+	if !matchesVMSelector(saltConfig, vm) {
+		log.V(1).Info("VirtualMachine does not match the SaltKeyConfig vmSelector, skipping")
+		return ctrl.Result{}, nil
 	}
 	return r.reconcileCreate(ctx, vm, saltConfig)
 }
 
-// reconcileCreate handles the VM create/update path. Phase 1 accepts the Salt minion key;
-// Phases 2–5 run the post-accept bootstrap chain (ping → refresh_pillar → highstate)
-// and subsequently watch for Day-2 role changes.
 func (r *VirtualMachineReconciler) reconcileCreate(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -306,20 +252,53 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	requeueAfter := parseDurationOrDefault(cfg.Spec.RequeueInterval, 30*time.Second)
+	acceptTimeout := parseDurationOrDefault(cfg.Spec.AcceptTimeout, 10*time.Minute)
+	timedOut := time.Since(vm.GetCreationTimestamp().Time) >= acceptTimeout
 
-	// Key not yet accepted: wait for the VM to be running with an IP before polling RaaS.
-	// v1alpha1 exposes status.phase; v1alpha4 exposes status.powerState.
+	switch {
+	case guestSignalled(vm):
+		if err := r.clearPreseedKey(ctx, vm, "the guest signal"); err != nil {
+			return ctrl.Result{}, err
+		}
+	case timedOut:
+		if err := r.clearPreseedKey(ctx, vm, "acceptTimeout "+acceptTimeout.String()); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	if vm.GetAnnotations()[AnnotationKeyStatus] != "Accepted" {
-		acceptTimeout := parseDurationOrDefault(cfg.Spec.AcceptTimeout, 10*time.Minute)
+		preseeded := vm.GetAnnotations()[AnnotationKeyStatus] == keyStatusPreseeded
+		if vm.GetAnnotations()[AnnotationKeyStatus] == keyStatusFailed &&
+			vm.GetAnnotations()[AnnotationMatchMethod] == matchMethodPreseed {
+			return ctrl.Result{}, nil
+		}
+		if cfg.Spec.KeyAcceptance == saltv1alpha1.KeyAcceptancePreseed && !preseeded {
+			saltClient, err := r.saltClientFromConfig(ctx, cfg)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("get salt client for %s: %w", vm.GetName(), err)
+			}
+			return r.runPreseedKey(ctx, vm, saltClient, requeueAfter)
+		}
 		phase, _, _ := unstructured.NestedString(vm.Object, "status", "phase")
 		powerState, _, _ := unstructured.NestedString(vm.Object, "status", "powerState")
 		primaryIP, _, _ := unstructured.NestedString(vm.Object, "status", "network", "primaryIP4")
 		running := phase == "Running" || powerState == "PoweredOn"
+		if (!running || primaryIP == "") && preseeded && timedOut {
+			if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationKeyStatus: keyStatusFailed}); err != nil {
+				return ctrl.Result{}, err
+			}
+			r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltKeyTimeout",
+				fmt.Sprintf("VM not running with an IP %s after creation, recreate it for a new key", acceptTimeout))
+			return ctrl.Result{}, nil
+		}
 		if !running || primaryIP == "" {
 			log.Info("Waiting for VM to be running with an IP",
 				"name", vm.GetName(),
 				"phase", phase, "powerState", powerState, "primaryIP", primaryIP)
 			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+		}
+		if preseeded {
+			return r.markPreseedAccepted(ctx, vm, requeueAfter)
 		}
 		saltClient, err := r.saltClientFromConfig(ctx, cfg)
 		if err != nil {
@@ -328,7 +307,6 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 		return r.runAcceptKey(ctx, vm, saltClient, primaryIP, acceptTimeout, requeueAfter)
 	}
 
-	// Key is accepted — ensure finalizer is present (upgrade-safety: may be absent on pre-finalizer VMs).
 	if !controllerutil.ContainsFinalizer(vm, saltFinalizer) {
 		fp := client.MergeFrom(vm.DeepCopy())
 		controllerutil.AddFinalizer(vm, saltFinalizer)
@@ -337,8 +315,6 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 		}
 	}
 
-	// Post-accept phases do not require the VM's IP — the minion communicates with the
-	// Salt master independently. We only need a live RaaS client.
 	saltClient, err := r.saltClientFromConfig(ctx, cfg)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("get salt client for %s: %w", vm.GetName(), err)
@@ -347,8 +323,6 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 	return r.reconcilePostAccept(ctx, vm, saltClient, cfg, minionID, requeueAfter)
 }
 
-// runAcceptKey looks for a pending Salt key that matches this VM and accepts it.
-// Returns early (requeue) if no key is found yet; marks Failed after acceptTimeout.
 func (r *VirtualMachineReconciler) runAcceptKey(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -387,7 +361,7 @@ func (r *VirtualMachineReconciler) runAcceptKey(
 		}
 		r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltKeyAccepted",
 			fmt.Sprintf("Salt key accepted for minion %q (match: %s)", match.MinionID, match.Method))
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
 	elapsed := time.Since(vm.GetCreationTimestamp().Time)
@@ -397,6 +371,9 @@ func (r *VirtualMachineReconciler) runAcceptKey(
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
+	if vm.GetAnnotations()[AnnotationKeyStatus] == keyStatusFailed {
+		return ctrl.Result{}, nil
+	}
 	log.Info("Accept timeout exceeded, marking as Failed",
 		"name", vm.GetName(), "elapsed", elapsed.Round(time.Second))
 	if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationKeyStatus: "Failed"}); err != nil {
@@ -407,12 +384,156 @@ func (r *VirtualMachineReconciler) runAcceptKey(
 	return ctrl.Result{}, nil
 }
 
-// reconcilePostAccept drives the post-accept state machine:
-// "" → Pinged → PillarRefreshed → HighstateDispatched → Ready (then Day-2 loop).
-//
-// Both Ready and every terminal Failed/<step> state route to checkReconvergence. Failed
-// does not mean the state machine will never advance again - it means it will not advance
-// on its own, and needs one of checkReconvergence's explicit triggers to leave.
+func (r *VirtualMachineReconciler) runPreseedKey(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	minionID := vm.GetName()
+
+	owner, err := r.minionIDOwner(ctx, vm, minionID)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if owner != nil {
+		ownerName := owner.GetNamespace() + "/" + owner.GetName()
+		if !owner.GetDeletionTimestamp().IsZero() {
+			log.Info("Minion ID still held by a VM being deleted, requeueing",
+				"name", vm.GetName(), "minionID", minionID, "owner", ownerName)
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+		}
+		if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationKeyStatus: keyStatusFailed}); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltMinionIDInUse",
+			fmt.Sprintf("Minion ID %q belongs to VirtualMachine %s, no key generated", minionID, ownerName))
+		return ctrl.Result{}, nil
+	}
+
+	states, err := saltClient.KeyStates(ctx, minionID)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("key state for %s: %w", minionID, err)
+	}
+	force := slices.ContainsFunc(states, func(s string) bool { return s != "denied" })
+	if slices.Contains(states, "pending") || slices.Contains(states, "rejected") {
+		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltForeignKeyReplaced",
+			fmt.Sprintf("Key for minion %q in state %s was not generated by the operator and is replaced",
+				minionID, strings.Join(states, ",")))
+	}
+
+	genCtx, cancel := context.WithTimeout(ctx, postAcceptStepTimeout)
+	defer cancel()
+	pair, err := saltClient.GenAcceptKey(genCtx, minionID, force)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("generate key for %s: %w", minionID, err)
+	}
+	if pair == nil {
+		return ctrl.Result{}, fmt.Errorf("generate key for %s: a key appeared on the master after the state check", minionID)
+	}
+	masterPub, err := saltClient.MasterPublicKey(genCtx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("master public key for %s: %w", minionID, err)
+	}
+	if err := r.writeBootstrapSecret(ctx, vm, minionID, pair, masterPub); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !controllerutil.ContainsFinalizer(vm, saltFinalizer) {
+		fp := client.MergeFrom(vm.DeepCopy())
+		controllerutil.AddFinalizer(vm, saltFinalizer)
+		if err := r.Patch(ctx, vm, fp); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if err := r.patchAnnotations(ctx, vm, map[string]string{
+		AnnotationKeyStatus:   keyStatusPreseeded,
+		AnnotationMinionID:    minionID,
+		AnnotationMatchMethod: matchMethodPreseed,
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("Preseeded Salt key", "name", vm.GetName(), "minionID", minionID, "forced", force)
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltKeyPreseeded",
+		fmt.Sprintf("Salt key generated and accepted for minion %q, written to Secret %s",
+			minionID, vm.GetName()+bootstrapSecretSuffix))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func (r *VirtualMachineReconciler) minionIDOwner(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	minionID string,
+) (*unstructured.Unstructured, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(virtualMachineGVK.GroupVersion().WithKind("VirtualMachineList"))
+	if err := r.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("list VirtualMachines: %w", err)
+	}
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.GetUID() != vm.GetUID() && other.GetAnnotations()[AnnotationMinionID] == minionID {
+			return other, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *VirtualMachineReconciler) writeBootstrapSecret(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	minionID string,
+	pair *salt.KeyPair,
+	masterPub string,
+) error {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vm.GetName() + bootstrapSecretSuffix,
+			Namespace: vm.GetNamespace(),
+			Labels:    map[string]string{LabelManagedBy: ManagedByOperator},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: vm.GetAPIVersion(),
+				Kind:       vm.GetKind(),
+				Name:       vm.GetName(),
+				UID:        vm.GetUID(),
+			}},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"minion.pem":        []byte(pair.Priv),
+			"minion.pub":        []byte(pair.Pub),
+			"minion_master.pub": []byte(masterPub),
+			"minion_id":         []byte(minionID),
+		},
+	}
+	err := r.Create(ctx, secret)
+	if apierrors.IsAlreadyExists(err) {
+		err = r.Update(ctx, secret)
+	}
+	if err != nil {
+		return fmt.Errorf("write Secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	return nil
+}
+
+func (r *VirtualMachineReconciler) markPreseedAccepted(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	minionID := vm.GetAnnotations()[AnnotationMinionID]
+	if err := r.patchAnnotations(ctx, vm, map[string]string{
+		AnnotationKeyStatus:  keyStatusAccepted,
+		AnnotationAcceptedAt: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltKeyAccepted",
+		fmt.Sprintf("VM running with the preseeded key for minion %q", minionID))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
 func (r *VirtualMachineReconciler) reconcilePostAccept(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -427,9 +548,6 @@ func (r *VirtualMachineReconciler) reconcilePostAccept(
 	}
 	switch vm.GetAnnotations()[AnnotationSaltStatus] {
 	case "":
-		// Enforce grace period: wait postAcceptDelay after key acceptance before the
-		// first ping. This gives the salt-minion time to re-establish its ZeroMQ
-		// connection — no annotation patch during the wait, so no spurious watch events.
 		if acceptedAt, err := time.Parse(time.RFC3339, vm.GetAnnotations()[AnnotationAcceptedAt]); err == nil {
 			if remaining := postAcceptDelay - time.Since(acceptedAt); remaining > 0 {
 				logf.FromContext(ctx).Info("Waiting for minion to connect after key acceptance",
@@ -442,18 +560,16 @@ func (r *VirtualMachineReconciler) reconcilePostAccept(
 		return r.runRefreshPillar(ctx, vm, saltClient, minionID, requeueAfter)
 	case "PillarRefreshed":
 		return r.runDispatchHighstate(ctx, vm, saltClient, minionID, requeueAfter)
-	case "HighstateDispatched":
+	case saltStatusHighstateDispatched:
 		return r.runPollHighstate(ctx, vm, saltClient, minionID,
 			vm.GetAnnotations()[AnnotationHighstateJID], requeueAfter)
 	case "Ready":
 		return r.checkReconvergence(ctx, vm, saltClient, cfg, minionID, requeueAfter)
 	default:
-		// Failed/<step>. Not self-advancing, but reachable by an explicit trigger.
 		return r.checkReconvergence(ctx, vm, saltClient, cfg, minionID, requeueAfter)
 	}
 }
 
-// runPing dispatches test.ping and advances the state machine to "Pinged" on success.
 func (r *VirtualMachineReconciler) runPing(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -464,6 +580,7 @@ func (r *VirtualMachineReconciler) runPing(
 	log := logf.FromContext(ctx)
 	log.Info("Running test.ping", "name", vm.GetName(), "minionID", minionID)
 
+	masterBefore, started := masterLastSeen(ctx, saltClient), time.Now()
 	pingCtx, cancel := context.WithTimeout(ctx, postAcceptStepTimeout)
 	defer cancel()
 
@@ -473,30 +590,40 @@ func (r *VirtualMachineReconciler) runPing(
 		if err != nil {
 			msg = fmt.Sprintf("test.ping: %v", err)
 		}
-		log.Error(err, "test.ping failed", "name", vm.GetName(), "minionID", minionID)
+		retryReason, failReason := "SaltPingRetry", "SaltPingFailed"
+		if silent := masterSilence(ctx, saltClient, masterBefore, started); silent != "" {
+			msg = silent + ", " + msg
+			retryReason, failReason = eventMasterSilent, eventMasterSilent
+		}
+		log.Error(err, "test.ping failed", "name", vm.GetName(), "minionID", minionID, "detail", msg)
 
-		// Retry without patching (no watch event) while within maxBootstrapDuration.
 		if acceptedAt, parseErr := time.Parse(time.RFC3339, vm.GetAnnotations()[AnnotationAcceptedAt]); parseErr == nil {
 			if time.Since(acceptedAt) < maxBootstrapDuration {
 				log.Info("test.ping transient failure — retrying in 60s",
 					"name", vm.GetName(), "minionID", minionID)
-				r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPingRetry",
+				r.Recorder.Event(vm, corev1.EventTypeWarning, retryReason,
 					fmt.Sprintf("test.ping failed for minion %q, retrying: %s", minionID, msg))
 				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 			}
 		}
 
+		if cErr := r.clearPreseedKey(ctx, vm, "the failed ping"); cErr != nil {
+			return ctrl.Result{}, cErr
+		}
 		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
 			AnnotationSaltStatus: "Failed/Ping",
-			AnnotationReady:      "false",
+			AnnotationReady:      annotationFalse,
 		}); pErr != nil {
 			return ctrl.Result{}, pErr
 		}
-		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPingFailed", msg)
+		r.Recorder.Event(vm, corev1.EventTypeWarning, failReason, msg)
 		return ctrl.Result{}, nil
 	}
 
 	log.Info("test.ping succeeded", "name", vm.GetName(), "minionID", minionID)
+	if err := r.clearPreseedKey(pingCtx, vm, "the first ping"); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationSaltStatus: "Pinged"}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -505,8 +632,59 @@ func (r *VirtualMachineReconciler) runPing(
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// runRefreshPillar dispatches saltutil.refresh_pillar and advances state to "PillarRefreshed".
-// Per the load-bearing invariant: refresh_pillar MUST precede every state.highstate.
+func (r *VirtualMachineReconciler) clearPreseedKey(ctx context.Context, vm *unstructured.Unstructured, trigger string) error {
+	if vm.GetAnnotations()[AnnotationMatchMethod] != matchMethodPreseed ||
+		vm.GetAnnotations()[AnnotationKeyCleared] == annotationTrue {
+		return nil
+	}
+	if err := r.clearBootstrapKey(ctx, vm); err != nil {
+		return err
+	}
+	if err := r.patchAnnotations(ctx, vm, map[string]string{AnnotationKeyCleared: annotationTrue}); err != nil {
+		return err
+	}
+	minionID := vm.GetAnnotations()[AnnotationMinionID]
+	logf.FromContext(ctx).Info("Cleared the private key from the bootstrap Secret",
+		"name", vm.GetName(), "minionID", minionID, "trigger", trigger)
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltKeyCleared",
+		fmt.Sprintf("Private key for minion %q removed from Secret %s after %s",
+			minionID, vm.GetName()+bootstrapSecretSuffix, trigger))
+	return nil
+}
+
+func guestSignalled(vm *unstructured.Unstructured) bool {
+	probes, _, _ := unstructured.NestedSlice(vm.Object, "spec", "readinessProbe", "guestInfo")
+	if !slices.ContainsFunc(probes, func(p any) bool {
+		m, ok := p.(map[string]any)
+		return ok && m["key"] == guestSignalKey
+	}) {
+		return false
+	}
+	conditions, _, _ := unstructured.NestedSlice(vm.Object, "status", "conditions")
+	return slices.ContainsFunc(conditions, func(c any) bool {
+		m, ok := c.(map[string]any)
+		return ok && m["type"] == vmConditionReady && m["status"] == "True"
+	})
+}
+
+func (r *VirtualMachineReconciler) clearBootstrapKey(ctx context.Context, vm *unstructured.Unstructured) error {
+	patch, err := json.Marshal(map[string]any{"data": map[string][]byte{
+		"minion.pem": []byte(bootstrapKeyCleared),
+		"minion.pub": []byte(bootstrapKeyCleared),
+	}})
+	if err != nil {
+		return err
+	}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name:      vm.GetName() + bootstrapSecretSuffix,
+		Namespace: vm.GetNamespace(),
+	}}
+	if err := r.Patch(ctx, secret, client.RawPatch(types.MergePatchType, patch)); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("clear Secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	return nil
+}
+
 func (r *VirtualMachineReconciler) runRefreshPillar(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -517,6 +695,7 @@ func (r *VirtualMachineReconciler) runRefreshPillar(
 	log := logf.FromContext(ctx)
 	log.Info("Running saltutil.refresh_pillar", "name", vm.GetName(), "minionID", minionID)
 
+	masterBefore, started := masterLastSeen(ctx, saltClient), time.Now()
 	rfCtx, cancel := context.WithTimeout(ctx, postAcceptStepTimeout)
 	defer cancel()
 
@@ -526,13 +705,18 @@ func (r *VirtualMachineReconciler) runRefreshPillar(
 		if err != nil {
 			msg = fmt.Sprintf("refresh_pillar: %v", err)
 		}
-		log.Error(err, "refresh_pillar failed", "name", vm.GetName(), "minionID", minionID)
+		retryReason, failReason := "SaltPillarRefreshRetry", "SaltPillarRefreshFailed"
+		if silent := masterSilence(ctx, saltClient, masterBefore, started); silent != "" {
+			msg = silent + ", " + msg
+			retryReason, failReason = eventMasterSilent, eventMasterSilent
+		}
+		log.Error(err, "refresh_pillar failed", "name", vm.GetName(), "minionID", minionID, "detail", msg)
 
 		if acceptedAt, parseErr := time.Parse(time.RFC3339, vm.GetAnnotations()[AnnotationAcceptedAt]); parseErr == nil {
 			if time.Since(acceptedAt) < maxBootstrapDuration {
 				log.Info("refresh_pillar transient failure — retrying in 60s",
 					"name", vm.GetName(), "minionID", minionID)
-				r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPillarRefreshRetry",
+				r.Recorder.Event(vm, corev1.EventTypeWarning, retryReason,
 					fmt.Sprintf("refresh_pillar failed for minion %q, retrying: %s", minionID, msg))
 				return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 			}
@@ -540,11 +724,11 @@ func (r *VirtualMachineReconciler) runRefreshPillar(
 
 		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
 			AnnotationSaltStatus: "Failed/PillarRefresh",
-			AnnotationReady:      "false",
+			AnnotationReady:      annotationFalse,
 		}); pErr != nil {
 			return ctrl.Result{}, pErr
 		}
-		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltPillarRefreshFailed", msg)
+		r.Recorder.Event(vm, corev1.EventTypeWarning, failReason, msg)
 		return ctrl.Result{}, nil
 	}
 
@@ -557,8 +741,6 @@ func (r *VirtualMachineReconciler) runRefreshPillar(
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// runDispatchHighstate dispatches state.highstate asynchronously and stores the JID.
-// The next reconcile will poll the result via runPollHighstate.
 func (r *VirtualMachineReconciler) runDispatchHighstate(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -577,7 +759,7 @@ func (r *VirtualMachineReconciler) runDispatchHighstate(
 		log.Error(err, "highstate dispatch failed", "name", vm.GetName(), "minionID", minionID)
 		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
 			AnnotationSaltStatus: "Failed/HighstateDispatch",
-			AnnotationReady:      "false",
+			AnnotationReady:      annotationFalse,
 		}); pErr != nil {
 			return ctrl.Result{}, pErr
 		}
@@ -588,10 +770,10 @@ func (r *VirtualMachineReconciler) runDispatchHighstate(
 
 	intentHash := computeIntentHash(vm.GetAnnotations())
 	if err := r.patchAnnotations(ctx, vm, map[string]string{
-		AnnotationSaltStatus:      "HighstateDispatched",
+		AnnotationSaltStatus:      saltStatusHighstateDispatched,
 		AnnotationHighstateJID:    jid,
 		AnnotationHighstateStatus: "InProgress",
-		AnnotationReady:           "false",
+		AnnotationReady:           annotationFalse,
 		AnnotationRolesHash:       intentHash,
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -602,8 +784,6 @@ func (r *VirtualMachineReconciler) runDispatchHighstate(
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// runPollHighstate makes a single PollJID call and advances state when the job completes.
-// If not done it requeues; transient poll errors are retried on the next reconcile.
 func (r *VirtualMachineReconciler) runPollHighstate(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -637,7 +817,7 @@ func (r *VirtualMachineReconciler) runPollHighstate(
 		log.Info("Highstate succeeded", "name", vm.GetName(), "minionID", minionID, "jid", jid)
 		if err := r.patchAnnotations(ctx, vm, map[string]string{
 			AnnotationSaltStatus:            "Ready",
-			AnnotationReady:                 "true",
+			AnnotationReady:                 annotationTrue,
 			AnnotationHighstateStatus:       "Success",
 			AnnotationHighstateTime:         now,
 			AnnotationHighstateFailedCount:  "0",
@@ -647,12 +827,13 @@ func (r *VirtualMachineReconciler) runPollHighstate(
 		}
 		r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltHighstateSuccess",
 			fmt.Sprintf("state.highstate succeeded for minion %q (JID: %s)", minionID, jid))
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	} else {
 		log.Info("Highstate failed", "name", vm.GetName(), "minionID", minionID,
 			"jid", jid, "retcode", result.Retcode, "failedStates", failedStates)
 		if err := r.patchAnnotations(ctx, vm, map[string]string{
 			AnnotationSaltStatus:            "Failed/Highstate",
-			AnnotationReady:                 "false",
+			AnnotationReady:                 annotationFalse,
 			AnnotationHighstateStatus:       "Failed",
 			AnnotationHighstateTime:         now,
 			AnnotationHighstateFailedCount:  strconv.Itoa(failedCount),
@@ -667,25 +848,6 @@ func (r *VirtualMachineReconciler) runPollHighstate(
 	return ctrl.Result{}, nil
 }
 
-// checkReconvergence decides whether a VM that will not advance on its own should re-run
-// the Salt chain. Reached from Ready and from every terminal Failed/<step> state, evaluating
-// three triggers:
-//
-//  1. The intent hash changed - Argo CD delivered new desired configuration. Needs no new
-//     annotation; alone, this is what lets a second self-service request after a failed
-//     first one actually take effect.
-//  2. AnnotationRetryRequest differs from AnnotationRetryHandled - covers what a hash
-//     cannot: the VM's own intent never changed, but the platform content that broke it has
-//     since been fixed, or Ops repaired the VM out of band.
-//  3. SaltKeyConfig.spec.retryToken differs from AnnotationBulkRetryHandled - the Ops-side
-//     lever for a platform-caused failure that stranded VMs across several tenant repos.
-//
-// Not gated on AnnotationRoles being non-empty, since a role-less VM still receives the
-// unconditional CIS baseline. The real gate is whether a highstate has ever been dispatched
-// (an empty AnnotationRolesHash).
-//
-// No automatic retry: every path needs an explicit trigger, so a broken VM stays visibly
-// broken rather than looping against a failure nobody has looked at.
 func (r *VirtualMachineReconciler) checkReconvergence(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -697,9 +859,14 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 	log := logf.FromContext(ctx)
 	annotations := vm.GetAnnotations()
 
+	failed := strings.HasPrefix(annotations[AnnotationSaltStatus], failedStatusPrefix)
+
 	previousHash := annotations[AnnotationRolesHash]
 	if previousHash == "" {
-		return ctrl.Result{}, nil // no prior dispatch to compare against
+		if !failed {
+			return ctrl.Result{}, nil
+		}
+		return r.restartFirstChain(ctx, vm, cfg, minionID, requeueAfter)
 	}
 	if !strings.HasPrefix(previousHash, intentHashVersion) {
 		if done, err := r.adoptLegacyIntentHash(ctx, vm, previousHash); done || err != nil {
@@ -707,7 +874,6 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 		}
 	}
 
-	failed := strings.HasPrefix(annotations[AnnotationSaltStatus], failedStatusPrefix)
 	intentChanged := computeIntentHash(annotations) != previousHash
 
 	retryRequest := annotations[AnnotationRetryRequest]
@@ -719,9 +885,6 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 	}
 	bulkChanged := bulkToken != "" && bulkToken != annotations[AnnotationBulkRetryHandled]
 
-	// A bulk token rescues stranded VMs only. Healthy VMs still record it as handled, so
-	// that "retry this environment" cannot be re-armed against a VM that fails weeks later
-	// for an unrelated reason.
 	if !intentChanged && !retryRequested && (!bulkChanged || !failed) {
 		if bulkChanged {
 			if err := r.patchAnnotations(ctx, vm, map[string]string{
@@ -731,17 +894,11 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 			}
 		}
 
-		// No explicit trigger fired. Scheduled enforcement is the only remaining reason to
-		// act, and it applies to Ready VMs alone: a terminal Failed/<step> VM is left where
-		// it is, so the no-automatic-retry rule in this function's doc comment still holds.
-		// Anything else (mid-chain, unknown status) is also left alone.
 		if annotations[AnnotationSaltStatus] != saltStatusReady {
 			return ctrl.Result{}, nil
 		}
 		due, wait := enforcementDue(cfg, string(vm.GetUID()), annotations[AnnotationHighstateTime], time.Now().UTC())
 		if !due {
-			// wait == 0 means enforcement is disabled or not evaluable, so the VM goes
-			// dormant exactly as it did before this feature existed.
 			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 		log.Info("Scheduled enforcement due, re-running refresh_pillar + highstate",
@@ -750,13 +907,6 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 			"interval", cfg.Spec.EnforcementInterval)
 	}
 
-	// Reset to the start of the chain rather than resuming at the failed step: ping proves
-	// the minion is reachable again, and re-entering at "" keeps refresh_pillar always
-	// preceding highstate.
-	//
-	// Trigger markers are recorded HERE, before the chain runs, not after it succeeds. A
-	// retry that fails again would otherwise land back in Failed/<step> with its trigger
-	// still unequal to its handled marker, and the operator would retry forever.
 	if failed {
 		log.Info("Reconvergence triggered from a terminal state, resetting the Salt chain",
 			"name", vm.GetName(), "minionID", minionID,
@@ -765,7 +915,7 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 			"bulkRetry", bulkChanged)
 		patch := map[string]string{
 			AnnotationSaltStatus:      "",
-			AnnotationReady:           "false",
+			AnnotationReady:           annotationFalse,
 			AnnotationHighstateStatus: "",
 			AnnotationRolesHash:       computeIntentHash(annotations),
 		}
@@ -787,6 +937,28 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 		"name", vm.GetName(), "minionID", minionID,
 		"intentChanged", intentChanged, "retryRequested", retryRequested)
 
+	markers := map[string]string{AnnotationRolesHash: computeIntentHash(annotations)}
+	if retryRequested {
+		markers[AnnotationRetryHandled] = retryRequest
+	}
+	if bulkChanged {
+		markers[AnnotationBulkRetryHandled] = bulkToken
+	}
+
+	return r.runDay2(ctx, vm, saltClient, minionID, markers, requeueAfter)
+}
+
+func (r *VirtualMachineReconciler) runDay2(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	saltClient salt.Client,
+	minionID string,
+	markers map[string]string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	masterBefore, started := masterLastSeen(ctx, saltClient), time.Now()
 	rfCtx, rfCancel := context.WithTimeout(ctx, postAcceptStepTimeout)
 	defer rfCancel()
 	ok, err := saltClient.RefreshPillar(rfCtx, minionID)
@@ -795,14 +967,19 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 		if err != nil {
 			msg = fmt.Sprintf("Day-2 refresh_pillar: %v", err)
 		}
-		log.Error(err, "Day-2 refresh_pillar failed", "name", vm.GetName(), "minionID", minionID)
-		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+		failReason := "SaltDay2PillarFailed"
+		if silent := masterSilence(ctx, saltClient, masterBefore, started); silent != "" {
+			msg = silent + ", " + msg
+			failReason = eventMasterSilent
+		}
+		log.Error(err, "Day-2 refresh_pillar failed", "name", vm.GetName(), "minionID", minionID, "detail", msg)
+		if pErr := r.patchAnnotations(ctx, vm, withMarkers(markers, map[string]string{
 			AnnotationSaltStatus: "Failed/PillarRefresh",
-			AnnotationReady:      "false",
-		}); pErr != nil {
+			AnnotationReady:      annotationFalse,
+		})); pErr != nil {
 			return ctrl.Result{}, pErr
 		}
-		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltDay2PillarFailed", msg)
+		r.Recorder.Event(vm, corev1.EventTypeWarning, failReason, msg)
 		return ctrl.Result{}, nil
 	}
 
@@ -811,10 +988,10 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 	jid, err := saltClient.DispatchHighstate(dispCtx, minionID)
 	if err != nil {
 		log.Error(err, "Day-2 highstate dispatch failed", "name", vm.GetName(), "minionID", minionID)
-		if pErr := r.patchAnnotations(ctx, vm, map[string]string{
+		if pErr := r.patchAnnotations(ctx, vm, withMarkers(markers, map[string]string{
 			AnnotationSaltStatus: "Failed/HighstateDispatch",
-			AnnotationReady:      "false",
-		}); pErr != nil {
+			AnnotationReady:      annotationFalse,
+		})); pErr != nil {
 			return ctrl.Result{}, pErr
 		}
 		r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltDay2HighstateFailed",
@@ -822,14 +999,66 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 		return ctrl.Result{}, nil
 	}
 
-	// Record the new intent hash, every trigger marker, and the JID atomically, so the next
-	// reconcile enters runPollHighstate with nothing left that could re-trigger this path.
-	patch := map[string]string{
-		AnnotationSaltStatus:      "HighstateDispatched",
+	if err := r.patchAnnotations(ctx, vm, withMarkers(markers, map[string]string{
+		AnnotationSaltStatus:      saltStatusHighstateDispatched,
 		AnnotationHighstateJID:    jid,
 		AnnotationHighstateStatus: "InProgress",
-		AnnotationReady:           "false",
-		AnnotationRolesHash:       computeIntentHash(annotations),
+		AnnotationReady:           annotationFalse,
+	})); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("Day-2 highstate dispatched", "name", vm.GetName(), "minionID", minionID, "jid", jid)
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltDay2Dispatched",
+		fmt.Sprintf("Day-2 state.highstate dispatched for minion %q (JID: %s)", minionID, jid))
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+func masterLastSeen(ctx context.Context, c salt.Client) string {
+	seen, err := c.MasterLastSeen(ctx)
+	if err != nil {
+		return ""
+	}
+	return seen
+}
+
+func masterSilence(ctx context.Context, c salt.Client, before string, started time.Time) string {
+	if before == "" || time.Since(started) < minMasterSilence || masterLastSeen(ctx, c) != before {
+		return ""
+	}
+	return fmt.Sprintf("the Salt master has not reported to RaaS since %s, it is down or cut off from RaaS", before)
+}
+
+func withMarkers(markers, patch map[string]string) map[string]string {
+	maps.Copy(patch, markers)
+	return patch
+}
+
+func (r *VirtualMachineReconciler) restartFirstChain(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+	cfg *saltv1alpha1.SaltKeyConfig,
+	minionID string,
+	requeueAfter time.Duration,
+) (ctrl.Result, error) {
+	annotations := vm.GetAnnotations()
+
+	retryRequest := annotations[AnnotationRetryRequest]
+	retryRequested := retryRequest != "" && retryRequest != annotations[AnnotationRetryHandled]
+	var bulkToken string
+	if cfg != nil {
+		bulkToken = cfg.Spec.RetryToken
+	}
+	bulkChanged := bulkToken != "" && bulkToken != annotations[AnnotationBulkRetryHandled]
+	if !retryRequested && !bulkChanged {
+		return ctrl.Result{}, nil
+	}
+
+	logf.FromContext(ctx).Info("Retry requested before the first highstate, restarting the Salt chain",
+		"name", vm.GetName(), "minionID", minionID, "from", annotations[AnnotationSaltStatus],
+		"retryRequested", retryRequested, "bulkRetry", bulkChanged)
+	patch := map[string]string{
+		AnnotationSaltStatus: "",
+		AnnotationReady:      annotationFalse,
 	}
 	if retryRequested {
 		patch[AnnotationRetryHandled] = retryRequest
@@ -840,27 +1069,11 @@ func (r *VirtualMachineReconciler) checkReconvergence(
 	if err := r.patchAnnotations(ctx, vm, patch); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("Day-2 highstate dispatched", "name", vm.GetName(), "minionID", minionID, "jid", jid)
-	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltDay2Dispatched",
-		fmt.Sprintf("Day-2 state.highstate dispatched for minion %q (JID: %s)", minionID, jid))
+	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltReconvergenceRequested",
+		fmt.Sprintf("Re-running the Salt chain for minion %q after a failure before its first highstate", minionID))
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
-// computeIntentHash returns a short SHA-256 hex digest over every tenant-declared
-// salt.vcf.io/* annotation on the VM: every key with that prefix except the operator's own
-// status keys (operatorStatusAnnotations). Used for Day-2 change detection: a mismatch with
-// AnnotationRolesHash triggers a refresh_pillar + highstate re-dispatch.
-//
-// Hashing the full intent set, not just roles, means a tag/*, cis-profile,
-// cis-exceptions/*, environment, or vault-path change also triggers Day-2, matching the
-// documented vm:tags:db_port override mechanism (which needs a change to take effect after
-// initial bootstrap, not only at creation time). The deny-list is checked against, rather
-// than an allow-list of known intent keys, so a newly introduced tenant annotation kind is
-// covered automatically, with no need to special-case each one here.
-//
-// Keys are sorted before hashing so the digest is independent of map iteration order. Go
-// randomizes map iteration order per process, so an unsorted digest would flap between
-// reconciles even with no actual annotation change, causing a spurious Day-2 dispatch loop.
 func computeIntentHash(annotations map[string]string) string {
 	keys := make([]string, 0, len(annotations))
 	for k := range annotations {
@@ -882,31 +1095,11 @@ func computeIntentHash(annotations map[string]string) string {
 	return intentHashVersion + hex.EncodeToString(h[:8])
 }
 
-// computeLegacyRolesHash reproduces the legacy hash algorithm, which covers only the roles
-// annotation with no version prefix. adoptLegacyIntentHash uses it to tell whether a VM
-// carrying a legacy-format hash has had a genuine roles change. Not for use in change
-// detection generally.
 func computeLegacyRolesHash(roles string) string {
 	h := sha256.Sum256([]byte(roles))
 	return hex.EncodeToString(h[:8])
 }
 
-// adoptLegacyIntentHash handles a stored hash in the legacy format (no intentHashVersion
-// prefix, roles-only).
-//
-// A legacy-format hash can never equal a current computeIntentHash digest, so comparing them
-// directly would mark every such VM as changed and dispatch all of them at once - an
-// unannounced fleet-wide mass action, unacceptable in a change-controlled environment even
-// though the underlying convergence is harmless (state runs are idempotent).
-//
-// Blindly treating a legacy hash as already current would risk silently swallowing a real,
-// pending roles change. Instead this recomputes computeLegacyRolesHash against the VM's
-// current roles value: a match means nothing the legacy hash could observe has changed, so
-// the VM is migrated to the current format in place with no dispatch; a mismatch means roles
-// genuinely changed, and the caller dispatches normally, writing the current format as a
-// side effect.
-//
-// Returns true when the caller should stop and requeue (migration written, nothing to do).
 func (r *VirtualMachineReconciler) adoptLegacyIntentHash(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -914,7 +1107,7 @@ func (r *VirtualMachineReconciler) adoptLegacyIntentHash(
 ) (bool, error) {
 	annotations := vm.GetAnnotations()
 	if computeLegacyRolesHash(annotations[AnnotationRoles]) != storedHash {
-		return false, nil // real roles change predating the upgrade: let the caller dispatch
+		return false, nil
 	}
 	logf.FromContext(ctx).Info("Migrating pre-upgrade intent hash without dispatching",
 		"name", vm.GetName())
@@ -926,8 +1119,6 @@ func (r *VirtualMachineReconciler) adoptLegacyIntentHash(
 	return true, nil
 }
 
-// reconcileDelete implements Phase 6: fire-and-forget key deletion on VM removal.
-// Key deletion errors are logged but do NOT block VM deletion.
 func (r *VirtualMachineReconciler) reconcileDelete(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -937,8 +1128,10 @@ func (r *VirtualMachineReconciler) reconcileDelete(
 
 	minionID := vm.GetAnnotations()[AnnotationMinionID]
 	if minionID == "" {
-		// No key was ever accepted — nothing to delete
 		return ctrl.Result{}, nil
+	}
+	if vm.GetAnnotations()[AnnotationKeyStatus] == keyStatusDeleted {
+		return r.removeSaltFinalizer(ctx, vm)
 	}
 
 	saltClient, err := r.saltClientFromConfig(ctx, cfg)
@@ -948,25 +1141,27 @@ func (r *VirtualMachineReconciler) reconcileDelete(
 	}
 
 	deleteErr := saltClient.DeleteKey(ctx, minionID)
-	status := "Deleted"
+	status := keyStatusDeleted
+	eventType, reason := corev1.EventTypeNormal, "SaltKeyDeleted"
 	eventMsg := fmt.Sprintf("Salt key deleted for minion %q", minionID)
 	if deleteErr != nil {
 		log.Error(deleteErr, "Could not delete Salt key (fire-and-forget)", "name", vm.GetName(), "minionID", minionID)
 		status = "DeleteFailed"
+		eventType, reason = corev1.EventTypeWarning, "SaltKeyDeleteFailed"
 		eventMsg = fmt.Sprintf("Salt key deletion failed for minion %q: %v", minionID, deleteErr)
 	} else {
 		log.Info("Deleted Salt key", "name", vm.GetName(), "minionID", minionID)
 	}
 
 	_ = r.patchAnnotations(ctx, vm, map[string]string{AnnotationKeyStatus: status})
-	r.Recorder.Event(vm, corev1.EventTypeNormal, "SaltKeyDeleted", eventMsg)
+	r.Recorder.Event(vm, eventType, reason, eventMsg)
+	return r.removeSaltFinalizer(ctx, vm)
+}
 
-	// Remove finalizer to unblock VM deletion from the API server.
-	// Re-fetch so the patch uses a fresh ResourceVersion and the cache-backed Get
-	// returns a well-typed *StatusError on NotFound (unlike the dynamic-client Patch
-	// error which may not be reliably identified by apierrors.IsNotFound).
-	// A concurrent reconcile may have already removed the finalizer and the VM may
-	// have been garbage-collected — both outcomes are treated as success.
+func (r *VirtualMachineReconciler) removeSaltFinalizer(
+	ctx context.Context,
+	vm *unstructured.Unstructured,
+) (ctrl.Result, error) {
 	latest := &unstructured.Unstructured{}
 	latest.SetGroupVersionKind(virtualMachineGVK)
 	if err := r.Get(ctx, client.ObjectKeyFromObject(vm), latest); err != nil {
@@ -982,31 +1177,35 @@ func (r *VirtualMachineReconciler) reconcileDelete(
 	return ctrl.Result{}, nil
 }
 
-// findSaltKeyConfig lists SaltKeyConfig CRs in the given namespace and returns the first one
-// whose Ready condition is True. Returns nil (no error) if none is ready — namespace is unenrolled.
 func (r *VirtualMachineReconciler) findSaltKeyConfig(ctx context.Context, namespace string) (*saltv1alpha1.SaltKeyConfig, error) {
 	configList := &saltv1alpha1.SaltKeyConfigList{}
 	if err := r.List(ctx, configList, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
+	var enrolled *saltv1alpha1.SaltKeyConfig
 	for i := range configList.Items {
 		cfg := &configList.Items[i]
-		if cfg.IsReady() {
+		if !cfg.IsReady() {
+			continue
+		}
+		if cfg.Labels[LabelManagedBy] != ManagedByOperator {
 			return cfg, nil
 		}
+		if enrolled == nil {
+			enrolled = cfg
+		}
 	}
-	return nil, nil
+	return enrolled, nil
 }
 
-// SetupWithManager registers the VirtualMachine controller with the operator Manager.
-// In addition to watching VMs, it watches SaltKeyConfig so that when a config
-// transitions to Ready=True, all VMs in that namespace are re-queued immediately.
 func (r *VirtualMachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	vm := &unstructured.Unstructured{}
 	vm.SetGroupVersionKind(virtualMachineGVK)
 
 	b := ctrl.NewControllerManagedBy(mgr).
-		For(vm).
+		For(vm, builder.WithPredicates(predicate.Funcs{
+			UpdateFunc: func(e event.UpdateEvent) bool { return !ownWritesOnly(e.ObjectOld, e.ObjectNew) },
+		})).
 		Watches(
 			&saltv1alpha1.SaltKeyConfig{},
 			handler.EnqueueRequestsFromMapFunc(r.saltKeyConfigToVMs),
@@ -1018,8 +1217,52 @@ func (r *VirtualMachineReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return b.Complete(r)
 }
 
-// saltKeyConfigToVMs maps a SaltKeyConfig change event to reconcile requests for
-// all VirtualMachines in that namespace that have the managed annotation set.
+func ownWritesOnly(oldObj, newObj client.Object) bool {
+	oldU, ok1 := oldObj.(*unstructured.Unstructured)
+	newU, ok2 := newObj.(*unstructured.Unstructured)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return equality.Semantic.DeepEqual(withoutOwnWrites(oldU), withoutOwnWrites(newU))
+}
+
+func withoutOwnWrites(vm *unstructured.Unstructured) map[string]any {
+	c := vm.DeepCopy()
+	unstructured.RemoveNestedField(c.Object, "metadata", "resourceVersion")
+	unstructured.RemoveNestedField(c.Object, "metadata", "managedFields")
+	annotations := c.GetAnnotations()
+	for k := range annotations {
+		if nonIntentAnnotations[k] && k != AnnotationRetryRequest {
+			delete(annotations, k)
+		}
+	}
+	delete(annotations, vmBackupVersionAnnotation)
+	delete(annotations, vmConversionAnnotation)
+	c.SetAnnotations(annotations)
+
+	conds, _, _ := unstructured.NestedSlice(c.Object, "status", "conditions")
+	kept := make([]any, 0, len(conds))
+	for _, cond := range conds {
+		if m, ok := cond.(map[string]any); ok && m["type"] == vmBackupCondition {
+			continue
+		}
+		kept = append(kept, cond)
+	}
+	if len(kept) == 0 {
+		unstructured.RemoveNestedField(c.Object, "status", "conditions")
+	} else {
+		_ = unstructured.SetNestedSlice(c.Object, kept, "status", "conditions")
+	}
+	return c.Object
+}
+
+const (
+	vmBackupVersionAnnotation = "vmoperator.vmware.com/backup-version"
+	vmConversionAnnotation    = "vmoperator.vmware.com/conversion"
+	vmBackupCondition         = "VirtualMachineBackupUpToDate"
+	vmConditionReady          = "Ready"
+)
+
 func (r *VirtualMachineReconciler) saltKeyConfigToVMs(ctx context.Context, obj client.Object) []reconcile.Request {
 	ns := obj.GetNamespace()
 
@@ -1035,7 +1278,7 @@ func (r *VirtualMachineReconciler) saltKeyConfigToVMs(ctx context.Context, obj c
 
 	var requests []reconcile.Request
 	for _, vm := range vmList.Items {
-		if vm.GetAnnotations()[AnnotationManaged] != "true" {
+		if vm.GetAnnotations()[AnnotationManaged] != annotationTrue {
 			continue
 		}
 		requests = append(requests, reconcile.Request{
@@ -1048,9 +1291,17 @@ func (r *VirtualMachineReconciler) saltKeyConfigToVMs(ctx context.Context, obj c
 	return requests
 }
 
-// saltClientFromConfig returns a logged-in RaaS client for the given SaltKeyConfig.
-// Clients are cached by config namespace/name and invalidated when the ResourceVersion
-// changes (config or secret rotated) or after saltClientCacheTTL.
+func matchesVMSelector(cfg *saltv1alpha1.SaltKeyConfig, vm *unstructured.Unstructured) bool {
+	if cfg.Spec.VMSelector == nil {
+		return true
+	}
+	sel, err := metav1.LabelSelectorAsSelector(cfg.Spec.VMSelector)
+	if err != nil {
+		return false
+	}
+	return sel.Matches(labels.Set(vm.GetLabels()))
+}
+
 func (r *VirtualMachineReconciler) saltClientFromConfig(
 	ctx context.Context,
 	cfg *saltv1alpha1.SaltKeyConfig,
@@ -1060,19 +1311,12 @@ func (r *VirtualMachineReconciler) saltClientFromConfig(
 		return cl, nil
 	}
 
-	// Cache miss — read credentials and create a new logged-in client.
-	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      cfg.Spec.CredentialsSecret,
-		Namespace: cfg.Namespace,
-	}, secret); err != nil {
+	conn, err := raasconn.Resolve(ctx, r.Client, cfg, r.DefaultConnection)
+	if err != nil {
 		return nil, err
 	}
 
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-
-	cl := r.SaltClientFactory(cfg.Spec.RaasURL, username, password, cfg.Spec.MasterID, cfg.Spec.SkipTLSVerify, logf.FromContext(ctx))
+	cl := r.SaltClientFactory(conn.URL, conn.Username, conn.Password, conn.MasterID, conn.SkipTLSVerify, logf.FromContext(ctx))
 
 	loginCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -1084,7 +1328,6 @@ func (r *VirtualMachineReconciler) saltClientFromConfig(
 	return cl, nil
 }
 
-// patchAnnotations merges the given key/value pairs into the VM's annotations using a strategic merge patch.
 func (r *VirtualMachineReconciler) patchAnnotations(
 	ctx context.Context,
 	vm *unstructured.Unstructured,
@@ -1100,25 +1343,12 @@ func (r *VirtualMachineReconciler) patchAnnotations(
 	return r.Patch(ctx, vm, patch)
 }
 
-// enforcementDue reports whether scheduled enforcement should re-run the Salt chain now,
-// and when the VM should next be re-examined if it should not.
-//
-// A zero wait alongside due=false means "never, on this configuration": enforcement is
-// switched off, or there is no completed highstate to measure from. The caller requeues on
-// the returned wait, and a zero value leaves the VM dormant, which is exactly the behaviour
-// that existed before scheduled enforcement.
-//
-// The interval is measured from the VM's own last highstate rather than from a shared
-// schedule, so VMs bootstrapped at different times come due at different times with no
-// pacing machinery. enforcementJitter spreads the remaining case, VMs onboarded together.
 func enforcementDue(cfg *saltv1alpha1.SaltKeyConfig, uid, lastHighstate string, now time.Time) (bool, time.Duration) {
 	if cfg == nil || cfg.Spec.EnforcementInterval == "" {
 		return false, 0
 	}
 	interval, err := time.ParseDuration(cfg.Spec.EnforcementInterval)
 	if err != nil || interval <= 0 {
-		// The CRD pattern rejects malformed values at admission, so reaching here means a
-		// value that parsed as well-formed but is unusable. Disable rather than guess.
 		return false, 0
 	}
 	if lastHighstate == "" {
@@ -1137,13 +1367,6 @@ func enforcementDue(cfg *saltv1alpha1.SaltKeyConfig, uid, lastHighstate string, 
 	return false, effective - elapsed
 }
 
-// enforcementJitter returns a stable per-VM offset in [0, interval/10), derived from the
-// VM's UID. Stable rather than random so a VM keeps the same slot across reconciles and
-// across operator restarts, instead of drifting every time it is evaluated.
-//
-// Without it, VMs onboarded in one batch share a bootstrap time and would stay in lockstep
-// for as long as they exist, reproducing the thundering herd that measuring from each VM's
-// own last highstate otherwise avoids.
 func enforcementJitter(uid string, interval time.Duration) time.Duration {
 	spread := interval / 10
 	if spread <= 0 || uid == "" {
@@ -1153,8 +1376,6 @@ func enforcementJitter(uid string, interval time.Duration) time.Duration {
 	return time.Duration(binary.BigEndian.Uint64(sum[:8]) % uint64(spread))
 }
 
-// parseDurationOrDefault parses a Go duration string (e.g. "10m", "30s").
-// Returns the fallback if the string is empty or unparseable.
 func parseDurationOrDefault(s string, fallback time.Duration) time.Duration {
 	if s == "" {
 		return fallback

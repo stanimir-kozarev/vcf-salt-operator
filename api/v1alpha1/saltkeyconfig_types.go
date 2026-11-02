@@ -9,26 +9,46 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+const (
+	KeyAcceptanceDiscovery = "discovery"
+	KeyAcceptancePreseed   = "preseed"
+)
 
 // SaltKeyConfigSpec defines the desired state of SaltKeyConfig.
 // Create one SaltKeyConfig per Supervisor namespace to enroll it for Salt key management.
 type SaltKeyConfigSpec struct {
 	// raasURL is the base URL of the VCF Salt RaaS API.
 	// Example: "https://aria-config.corp:443"
-	// +kubebuilder:validation:Required
+	// Required when credentialsSecret is set. Without credentialsSecret the operator's default
+	// connection supplies it, and a value here must equal the default's.
+	// +optional
 	// +kubebuilder:validation:Pattern=`^https?://`
-	RaasURL string `json:"raasURL"`
+	RaasURL string `json:"raasURL,omitempty"`
 
 	// credentialsSecret is the name of a Secret in the same namespace that holds
 	// the RaaS username and password. The Secret must have keys "username" and "password".
-	// +kubebuilder:validation:Required
+	// Leave it empty to use the operator's default connection, a Secret in the operator's
+	// own namespace set at install time, which keeps RaaS credentials out of this namespace.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
-	CredentialsSecret string `json:"credentialsSecret"`
+	CredentialsSecret string `json:"credentialsSecret,omitempty"`
 
-	// acceptTimeout is the maximum time to wait for a Salt minion key to appear in the
-	// pending list after a VM becomes Running. Defaults to "10m".
+	// keyAcceptance selects how a VM's Salt minion key becomes accepted.
+	// "discovery" accepts a pending key whose minion ID matches the VM by name or IP.
+	// "preseed" generates the key pair on the master through RaaS, accepted before the VM
+	// boots, and writes it with the master's public key to the Secret <vm>-salt-bootstrap,
+	// which the VM's cloud-init places under /etc/salt. The minion ID is the VM name.
+	// A VM whose key is already accepted keeps it when the namespace switches mode.
+	// Preseed needs the operator's permission to create, update and patch Secrets.
+	// +optional
+	// +kubebuilder:validation:Enum=discovery;preseed
+	// +kubebuilder:default=discovery
+	KeyAcceptance string `json:"keyAcceptance,omitempty"`
+
+	// acceptTimeout is the maximum time, counted from VM creation, to wait for a Salt
+	// minion key to appear in the pending list. In preseed it bounds how long the private
+	// key stays in the bootstrap Secret: once it passes, the key is cleared, and a VM not yet
+	// running with an IP is marked Failed. Defaults to "10m".
 	// +optional
 	// +kubebuilder:default="10m"
 	AcceptTimeout string `json:"acceptTimeout,omitempty"`
@@ -42,21 +62,25 @@ type SaltKeyConfigSpec struct {
 	// masterID is the Salt master identifier as registered in VCF Salt.
 	// This value is used when accepting or deleting minion keys via the RaaS API.
 	// Example: "saltstack_enterprise_installer"
-	// +kubebuilder:validation:Required
+	// Required when credentialsSecret is set. Without credentialsSecret the operator's default
+	// connection supplies it, and a value here must equal the default's.
+	// +optional
 	// +kubebuilder:validation:MinLength=1
-	MasterID string `json:"masterID"`
+	MasterID string `json:"masterID,omitempty"`
 
 	// skipTLSVerify disables TLS certificate verification when connecting to the RaaS API.
-	// Set to true for environments with self-signed certificates.
+	// Set to true for environments with self-signed certificates. With the operator's default
+	// connection it can only be true if the default connection allows it, and the TLS mode in
+	// use is the default connection's, which the Ready condition states.
 	// +optional
-	// +kubebuilder:default=false
 	SkipTLSVerify bool `json:"skipTLSVerify,omitempty"`
 
-	// vmLabelSelector restricts which VirtualMachine resources in this namespace are managed.
+	// vmSelector restricts which VirtualMachine resources in this namespace are managed.
 	// Only VMs matching this selector AND having the annotation salt.vcf.io/managed=true
 	// will have their Salt keys managed. If omitted, all annotated VMs are managed.
+	// A VM that is being deleted always gets its key removed, whatever the selector says,
+	// so narrowing the selector never strands a key or a finalizer.
 	// +optional
-	// TODO: VMSelector is defined in the API but not yet enforced by the controller.
 	VMSelector *metav1.LabelSelector `json:"vmSelector,omitempty"`
 
 	// retryToken re-runs the Salt chain for every VirtualMachine in this namespace that is
@@ -108,8 +132,8 @@ type SaltKeyConfigStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// conditions represent the current state of the SaltKeyConfig resource.
-	// The Ready condition is set True when the credentials Secret is found and valid
-	// and all duration fields parse correctly.
+	// The Ready condition is set True when the RaaS connection resolves, from the credentials
+	// Secret or the operator's default connection, and all duration fields parse correctly.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -147,8 +171,6 @@ type SaltKeyConfigList struct {
 	Items           []SaltKeyConfig `json:"items"`
 }
 
-// IsReady reports whether the SaltKeyConfig credentials have been validated
-// and the config is ready to be used by the VirtualMachine controller.
 func (cfg *SaltKeyConfig) IsReady() bool {
 	return apimeta.IsStatusConditionTrue(cfg.Status.Conditions, "Ready")
 }

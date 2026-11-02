@@ -1,6 +1,4 @@
 ---
-# Minimal VirtualMachine CRD stub for controller unit tests.
-# Mirrors the fields the operator reads from vmoperator.vmware.com/v1alpha4.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -38,3 +36,8 @@ spec:
                   properties:
                     primaryIP4:
                       type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true

@@ -26,5 +26,44 @@ imagePullSecret:
 
 #@schema/desc "VCF Salt (RaaS) client defaults."
 raas:
-  #@schema/desc "Default TLS verification mode for SaltKeyConfigs. Individual CRs can override."
+  #@schema/desc "Deprecated and ignored. Use raas.connection.insecureSkipVerify, or spec.skipTLSVerify on a SaltKeyConfig with its own credentials Secret. Kept so existing install values still validate."
   defaultInsecureSkipVerify: false
+  #@schema/desc "Name of the Secret in the operator's namespace holding the default RaaS connection."
+  connectionSecret: raas-connection
+  #@schema/desc "The default RaaS connection. With username set, the bundle creates the connection Secret from these values, the supported route on a Supervisor."
+  connection:
+    #@schema/desc "Base URL of the VCF Salt RaaS API."
+    url: ""
+    #@schema/desc "Salt master ID as registered in VCF Salt."
+    masterID: ""
+    username: ""
+    password: ""
+    #@schema/desc "Skip TLS verification for the default connection. SaltKeyConfigs using it can only skip verification if this is true."
+    insecureSkipVerify: false
+
+#@schema/desc "Namespaces the operator enrols itself, each with a SaltKeyConfig named salt-config that uses the default connection. Off unless one of namespaces, all or namespaceSelector is set. A namespace that already has a SaltKeyConfig is never enrolled, and a team config added later replaces the operator's. Turning enrolment off removes the configs it created."
+enrolment:
+  #@schema/desc "Namespaces enrolled by name."
+  namespaces:
+  - ""
+  #@schema/desc "Enrol every namespace not excluded by excludePrefixes."
+  all: false
+  #@schema/desc "Label selector for namespaces to enrol, for example salt=enabled."
+  namespaceSelector: ""
+  #@schema/desc "Comma-separated namespace name prefixes never enrolled. Empty keeps the operator's default, which excludes the Supervisor's system namespaces."
+  excludePrefixes: ""
+  #@schema/desc "keyAcceptance of the SaltKeyConfigs the operator enrols, discovery or preseed. Preseed also grants the operator create, update and patch of Secrets, never read."
+  #@schema/validation one_of=["discovery", "preseed"]
+  keyAcceptance: discovery
+
+#@schema/desc "Stale key scavenger."
+scavenger:
+  #@schema/desc "Comma-separated glob patterns of minion IDs the scavenger never reports or deletes, such as the master's own minion and any minion that is not a VM."
+  excludeMinions: ""
+
+#@schema/desc "Operator permissions."
+rbac:
+  #@schema/desc "Grant cluster-wide read of Secrets, for SaltKeyConfigs that name a credentials Secret in their own namespace. Set false when every SaltKeyConfig uses the default connection, which a VCF Service install requires."
+  tenantCredentialSecrets: true
+  #@schema/desc "Grant cluster-wide create, update and patch of Secrets, never read, for team SaltKeyConfigs with keyAcceptance preseed. Not needed when enrolment.keyAcceptance is preseed, which grants the same. The operator writes each VM's key pair to the Secret <vm>-salt-bootstrap."
+  preseedKeys: false

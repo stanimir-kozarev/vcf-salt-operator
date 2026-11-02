@@ -1,6 +1,4 @@
 ---
-# Supervisor Service identity. `metadata.name` is the service ID validated by
-# vCenter (and, on pre-VCF9 installs, the supervisor-services-allow-list.txt).
 apiVersion: data.packaging.carvel.dev/v1alpha1
 kind: PackageMetadata
 metadata:

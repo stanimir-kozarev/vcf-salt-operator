@@ -1,8 +1,4 @@
 ---
-# Versioned Package. `metadata.name`/`spec.version` are templated at build time by
-# `make supervisor-service-yaml` (VERSION=...), same as the imgpkgBundle digest below -
-# never hand-edit the __VERSION__ placeholders or a released Package will carry a stale
-# version label even though its bundle digest is current.
 apiVersion: data.packaging.carvel.dev/v1alpha1
 kind: Package
 metadata:
@@ -12,6 +8,13 @@ spec:
   refName: vcf-salt-operator.salt.vcf.io
   version: __VERSION__
   releaseNotes: |
+    - Default RaaS connection from the install values under raas.connection, used by
+      every SaltKeyConfig without spec.credentialsSecret
+    - Automatic enrolment of the namespaces named under enrolment, each with a
+      SaltKeyConfig on the default connection, removed again when a team's own config
+      appears, the namespace leaves enrolment or enrolment is turned off
+    - SaltKeyConfig.spec.vmSelector limits which annotated VMs are onboarded
+    - Scavenger exclusions under scavenger.excludeMinions
     - VM reconvergence from terminal Failed/<step> states, triggered by an intent
       annotation change, a per-VM salt.vcf.io/retry-request, or a namespace-wide
       SaltKeyConfig.spec.retryToken
@@ -87,14 +90,102 @@ spec:
               type: boolean
               default: false
               description: |
-                If true, SaltKeyConfig instances default to skipping TLS
-                verification against the RaaS endpoint. Per-SaltKeyConfig
-                settings still override this.
+                Deprecated and ignored. Use raas.connection.insecureSkipVerify, or
+                spec.skipTLSVerify on a SaltKeyConfig with its own credentials
+                Secret. Kept so existing install values still validate.
+            connectionSecret:
+              type: string
+              default: raas-connection
+              description: Name of the Secret in the operator's namespace holding the default RaaS connection.
+            connection:
+              type: object
+              description: |
+                The default RaaS connection, used by every SaltKeyConfig without
+                spec.credentialsSecret. With username set, the bundle creates the
+                connection Secret from these values, the supported route on a
+                Supervisor, where the service namespace is not writable otherwise.
+              properties:
+                url:
+                  type: string
+                  default: ""
+                masterID:
+                  type: string
+                  default: ""
+                username:
+                  type: string
+                  default: ""
+                password:
+                  type: string
+                  default: ""
+                insecureSkipVerify:
+                  type: boolean
+                  default: false
+        enrolment:
+          type: object
+          description: |
+            Namespaces the operator enrols itself, each with a SaltKeyConfig named
+            salt-config that uses the default connection. Off unless one of
+            namespaces, all or namespaceSelector is set. A namespace that already
+            has a SaltKeyConfig is never enrolled, and a team config added later
+            replaces the operator's. Turning enrolment off removes the configs it
+            created.
+          properties:
+            namespaces:
+              type: array
+              items:
+                type: string
+              default: []
+            all:
+              type: boolean
+              default: false
+            namespaceSelector:
+              type: string
+              default: ""
+            excludePrefixes:
+              type: string
+              default: ""
+            keyAcceptance:
+              type: string
+              enum: [discovery, preseed]
+              default: discovery
+              description: |
+                keyAcceptance of the SaltKeyConfigs the operator enrols. Preseed also
+                grants the operator create, update and patch of Secrets, never read.
+        scavenger:
+          type: object
+          description: Stale key scavenger.
+          properties:
+            excludeMinions:
+              type: string
+              default: ""
+              description: |
+                Comma-separated glob patterns of minion IDs the scavenger never
+                reports or deletes, such as the master's own minion and any minion
+                that is not a VM, for example saltmaster,infra-*.
+        rbac:
+          type: object
+          description: Operator permissions.
+          properties:
+            tenantCredentialSecrets:
+              type: boolean
+              default: true
+              description: |
+                Grant cluster-wide read of Secrets, for SaltKeyConfigs that name a
+                credentials Secret in their own namespace. Set false when every
+                SaltKeyConfig uses the default connection, which a VCF Service
+                install requires.
+            preseedKeys:
+              type: boolean
+              default: false
+              description: |
+                Grant cluster-wide create, update and patch of Secrets, never read, for
+                team SaltKeyConfigs with keyAcceptance preseed. Not needed when
+                enrolment.keyAcceptance is preseed, which grants the same. The
+                operator writes each VM's key pair to the Secret <vm>-salt-bootstrap.
   template:
     spec:
       fetch:
       - imgpkgBundle:
-          # Rewritten to an immutable digest by `make supervisor-service-yaml`.
           image: ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:__VERSION__
       template:
       - ytt:

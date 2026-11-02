@@ -20,3 +20,24 @@ imagePullSecret:
 
 raas:
   defaultInsecureSkipVerify: false
+  connectionSecret: raas-connection
+  connection:
+    url: ""
+    masterID: ""
+    username: ""
+    password: ""
+    insecureSkipVerify: false
+
+enrolment:
+  namespaces: []
+  all: false
+  namespaceSelector: ""
+  excludePrefixes: ""
+  keyAcceptance: discovery
+
+scavenger:
+  excludeMinions: ""
+
+rbac:
+  tenantCredentialSecrets: true
+  preseedKeys: false

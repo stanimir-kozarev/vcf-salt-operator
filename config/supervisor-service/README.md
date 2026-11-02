@@ -182,6 +182,27 @@ On the Supervisor:
   `~/.docker/config.json`) so the operator + scavenger pods pull their images
   from Nexus.
 
+## RaaS connection
+
+Each Supervisor needs one RaaS connection, held in the Secret named by
+`raas.connectionSecret` (default `raas-connection`) in the operator's namespace, with keys
+`url`, `masterID`, `username`, `password` and optional `skipTLSVerify`. Set
+`raas.connection` in the install values and the bundle creates it. That is the supported
+route on a Supervisor, since the service namespace is not writable through supported
+tools. A namespace is then enrolled
+by a `SaltKeyConfig` with no connection fields, and its tenants never hold RaaS credentials.
+
+`rbac.tenantCredentialSecrets` (default `true`) keeps the older enrolment working, where a
+`SaltKeyConfig` names a credentials Secret in its own namespace, by granting the operator
+cluster-wide `get` on Secrets. Set it `false` once every namespace uses the default
+connection. A VCF Service install needs it `false`, since VCF 9.1 refuses an unsigned
+service's cluster-wide Secret reads.
+
+The scavenger compares every accepted key on the RaaS master with the VMs it can see, so
+the master's own minion and any minion that is not a VM always look stale. List them in
+`scavenger.excludeMinions`, comma-separated globs such as `saltmaster,infra-*`, before
+running the scavenger with `--dry-run=false`.
+
 ## Upload and install
 
 1. vSphere Client → **Workload Management → Services → Add New Service**

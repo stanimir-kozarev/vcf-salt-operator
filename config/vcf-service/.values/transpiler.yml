@@ -1,0 +1,66 @@
+#@ load("@ytt:data", "data")
+
+#@ def source_regions():
+#@   inv = getattr(data.values, "inventory", None)
+#@   if inv != None:
+#@     return getattr(inv, "regions", [])
+#@   end
+#@   return getattr(data.values, "regions", [])
+#@ end
+
+#@ DEFAULTS = {
+#@   "raasURL": "",
+#@   "raasMasterID": "",
+#@   "raasUsername": "",
+#@   "raasPassword": "",
+#@   "raasInsecureSkipVerify": False,
+#@   "enrolNamespaces": [],
+#@   "enrolAllNamespaces": False,
+#@   "enrolNamespaceSelector": "",
+#@   "enrolKeyAcceptance": "discovery",
+#@   "preseedKeys": False,
+#@   "scavengerExcludeMinions": "",
+#@ }
+
+#@ def entered(name):
+#@   for region in getattr(data.values, "regions", []):
+#@     if region.name == name:
+#@       return getattr(region, "configuration", None)
+#@     end
+#@   end
+#@   return None
+#@ end
+
+#@ def configuration(region):
+#@   given = getattr(region, "configuration", None)
+#@   if given == None:
+#@     given = entered(region.name)
+#@   end
+#@   result = {}
+#@   for key in DEFAULTS:
+#@     value = DEFAULTS[key]
+#@     if given != None:
+#@       value = getattr(given, key, value)
+#@     end
+#@     if type(value) == "list":
+#@       value = list(value)
+#@     end
+#@     result[key] = value
+#@   end
+#@   return result
+#@ end
+
+#@ def merge_regions():
+#@   result = []
+#@   for region in source_regions():
+#@     result.append({
+#@       "name": region.name,
+#@       "supervisors": [getattr(s, "name", s) for s in region.supervisors],
+#@       "configuration": configuration(region),
+#@     })
+#@   end
+#@   return result
+#@ end
+
+---
+regions: #@ merge_regions()

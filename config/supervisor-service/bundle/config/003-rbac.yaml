@@ -20,9 +20,18 @@ rules:
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["create", "patch"]
+#@ e = data.values.enrolment
+#@ enrolled = len(e.namespaces) > 0 or e.all or e.namespaceSelector != ""
+#@ if data.values.rbac.tenantCredentialSecrets:
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "list", "watch"]
+  verbs: ["get"]
+#@ end
+#@ if data.values.rbac.preseedKeys or (enrolled and e.keyAcceptance == "preseed"):
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "update", "patch"]
+#@ end
 - apiGroups: ["salt.vcf.io"]
   resources: ["saltkeyconfigs"]
   verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
@@ -41,6 +50,11 @@ rules:
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+#@ if enrolled:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+#@ end
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -78,9 +92,11 @@ rules:
 - apiGroups: ["salt.vcf.io"]
   resources: ["saltkeyconfigs"]
   verbs: ["get", "list", "watch"]
+#@ if data.values.rbac.tenantCredentialSecrets:
 - apiGroups: [""]
   resources: ["secrets"]
   verbs: ["get"]
+#@ end
 - apiGroups: ["vmoperator.vmware.com"]
   resources: ["virtualmachines"]
   verbs: ["get", "list", "watch"]
@@ -97,6 +113,39 @@ roleRef:
   kind: ClusterRole
   name: vcf-salt-operator-scavenger
 subjects:
+- kind: ServiceAccount
+  name: vcf-salt-scavenger
+  namespace: #@ data.values.namespace
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vcf-salt-operator-connection-reader
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames:
+  - #@ data.values.raas.connectionSecret
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vcf-salt-operator-connection-reader
+  namespace: #@ data.values.namespace
+  labels:
+    app.kubernetes.io/name: vcf-salt-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vcf-salt-operator-connection-reader
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: #@ data.values.namespace
 - kind: ServiceAccount
   name: vcf-salt-scavenger
   namespace: #@ data.values.namespace

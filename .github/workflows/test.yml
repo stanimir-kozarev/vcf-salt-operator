@@ -23,3 +23,25 @@ jobs:
         run: |
           go mod tidy
           make test
+
+  render-check:
+    name: Render the three install modes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install ytt
+        uses: carvel-dev/setup-action@v2
+        with:
+          only: ytt
+
+      - name: Render and assert
+        run: |
+          pip install pyyaml
+          make render-check

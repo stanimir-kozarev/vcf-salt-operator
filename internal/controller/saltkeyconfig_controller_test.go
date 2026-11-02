@@ -12,18 +12,20 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	saltv1alpha1 "github.com/stanimir-kozarev/vcf-salt-operator/api/v1alpha1"
+	"github.com/stanimir-kozarev/vcf-salt-operator/internal/raasconn"
 )
 
-// saltCfgReconciler returns a configured SaltKeyConfigReconciler for tests.
 func saltCfgReconciler() *SaltKeyConfigReconciler {
 	return &SaltKeyConfigReconciler{Client: k8sClient}
 }
 
-// reconcileCfg runs the reconciler against the SaltKeyConfig named "salt-config" and returns the fetched result.
 func reconcileCfg(ctx context.Context, ns string) *saltv1alpha1.SaltKeyConfig {
 	GinkgoHelper()
 	_, err := saltCfgReconciler().Reconcile(ctx, reconcile.Request{
@@ -36,7 +38,6 @@ func reconcileCfg(ctx context.Context, ns string) *saltv1alpha1.SaltKeyConfig {
 	return result
 }
 
-// findReadyCondition returns the Ready condition from the SaltKeyConfig status, or nil.
 func findReadyCondition(cfg *saltv1alpha1.SaltKeyConfig) *metav1.Condition {
 	for i := range cfg.Status.Conditions {
 		if cfg.Status.Conditions[i].Type == ConditionReady {
@@ -102,6 +103,75 @@ var _ = Describe("SaltKeyConfig Controller", func() {
 		})
 	})
 
+	Context("Default connection", func() {
+		var opNS string
+
+		BeforeEach(func() {
+			opNS = "op-test-" + randomSuffix()
+			opNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: opNS}}
+			Expect(k8sClient.Create(ctx, opNamespace)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, opNamespace) })
+			conn := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "raas-connection", Namespace: opNS},
+				Data: map[string][]byte{
+					"url": []byte("https://raas.platform"), "masterID": []byte("master-01"),
+					"username": []byte("u"), "password": []byte("p"),
+				},
+			}
+			Expect(k8sClient.Create(ctx, conn)).To(Succeed())
+		})
+
+		reconcileWithDefault := func(spec saltv1alpha1.SaltKeyConfigSpec) *metav1.Condition {
+			GinkgoHelper()
+			cfg := &saltv1alpha1.SaltKeyConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: "salt-config", Namespace: ns},
+				Spec:       spec,
+			}
+			Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cfg) })
+			r := &SaltKeyConfigReconciler{
+				Client:            k8sClient,
+				DefaultConnection: raasconn.Default{Namespace: opNS, SecretName: "raas-connection"},
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "salt-config", Namespace: ns},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			result := &saltv1alpha1.SaltKeyConfig{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "salt-config", Namespace: ns}, result)).To(Succeed())
+			return findReadyCondition(result)
+		}
+
+		It("should accept a SaltKeyConfig with no connection fields and set Ready=True", func() {
+			cond := reconcileWithDefault(saltv1alpha1.SaltKeyConfigSpec{})
+			Expect(cond).NotTo(BeNil())
+			Expect(string(cond.Status)).To(Equal("True"))
+			Expect(cond.Message).To(ContainSubstring("default RaaS connection"))
+			Expect(cond.Message).To(ContainSubstring("TLS verification on"))
+		})
+
+		It("should not store a skipTLSVerify the user never set", func() {
+			cfg := &saltv1alpha1.SaltKeyConfig{
+				ObjectMeta: metav1.ObjectMeta{Name: "no-tls-field", Namespace: ns},
+			}
+			Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cfg) })
+			stored := &unstructured.Unstructured{}
+			stored.SetGroupVersionKind(saltv1alpha1.GroupVersion.WithKind("SaltKeyConfig"))
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "no-tls-field", Namespace: ns}, stored)).To(Succeed())
+			_, found, err := unstructured.NestedFieldNoCopy(stored.Object, "spec", "skipTLSVerify")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeFalse())
+		})
+
+		It("should set Ready=False with ConnectionMismatch for another endpoint", func() {
+			cond := reconcileWithDefault(saltv1alpha1.SaltKeyConfigSpec{RaasURL: "https://attacker.example"})
+			Expect(cond).NotTo(BeNil())
+			Expect(string(cond.Status)).To(Equal("False"))
+			Expect(cond.Reason).To(Equal(ReasonConnectionMismatch))
+		})
+	})
+
 	Context("Ready=False: Secret problems", func() {
 		It("should set Ready=False with SecretNotFound when Secret is missing", func() {
 			makeCfg("nonexistent-secret", "", "")
@@ -137,6 +207,60 @@ var _ = Describe("SaltKeyConfig Controller", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(string(cond.Status)).To(Equal("False"))
 			Expect(cond.Reason).To(Equal(ReasonSecretInvalid))
+		})
+	})
+
+	Context("Retry on Secret problems", func() {
+		reconcileResult := func(r *SaltKeyConfigReconciler) ctrl.Result {
+			GinkgoHelper()
+			res, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "salt-config", Namespace: ns},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			return res
+		}
+
+		It("should retry a missing namespace Secret and turn Ready once it exists", func() {
+			makeCfg("late-creds", "", "")
+			Expect(reconcileResult(saltCfgReconciler()).RequeueAfter).To(Equal(secretRetryInterval))
+
+			makeSecret("late-creds", map[string][]byte{"username": []byte("a"), "password": []byte("b")})
+			Expect(reconcileResult(saltCfgReconciler()).RequeueAfter).To(BeZero())
+			Expect(findReadyCondition(reconcileCfg(ctx, ns)).Reason).To(Equal(ReasonReady))
+		})
+
+		It("should retry a missing default connection Secret", func() {
+			cfg := &saltv1alpha1.SaltKeyConfig{ObjectMeta: metav1.ObjectMeta{Name: "salt-config", Namespace: ns}}
+			Expect(k8sClient.Create(ctx, cfg)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cfg) })
+			r := &SaltKeyConfigReconciler{
+				Client:            k8sClient,
+				DefaultConnection: raasconn.Default{Namespace: ns, SecretName: "raas-connection"},
+			}
+			Expect(reconcileResult(r).RequeueAfter).To(Equal(secretRetryInterval))
+		})
+
+		It("should not retry a spec error", func() {
+			makeSecret("creds", map[string][]byte{"username": []byte("a"), "password": []byte("b")})
+			makeCfg("creds", "not-a-duration", "")
+			Expect(reconcileResult(saltCfgReconciler()).RequeueAfter).To(BeZero())
+		})
+	})
+
+	Context("Ready=False: invalid vmSelector", func() {
+		It("should set Ready=False with InvalidSelector for an unknown operator", func() {
+			makeSecret("creds", map[string][]byte{"username": []byte("a"), "password": []byte("b")})
+			cfg := makeCfg("creds", "10m", "30s")
+			patch := client.MergeFrom(cfg.DeepCopy())
+			cfg.Spec.VMSelector = &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "salt", Operator: "Bogus", Values: []string{"yes"}},
+			}}
+			Expect(k8sClient.Patch(ctx, cfg, patch)).To(Succeed())
+
+			cond := findReadyCondition(reconcileCfg(ctx, ns))
+			Expect(cond).NotTo(BeNil())
+			Expect(string(cond.Status)).To(Equal("False"))
+			Expect(cond.Reason).To(Equal(ReasonInvalidSelector))
 		})
 	})
 
@@ -191,5 +315,4 @@ var _ = Describe("SaltKeyConfig Controller", func() {
 			Expect(second.Status.ObservedGeneration).To(Equal(second.Generation))
 		})
 	})
-
 })

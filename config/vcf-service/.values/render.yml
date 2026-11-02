@@ -1,0 +1,19 @@
+regions:
+  - name: region-a
+    supervisors:
+      - supervisor-a
+    configuration:
+      raasURL: https://raas.example:443
+      raasMasterID: saltstack_enterprise_installer
+      raasUsername: render-only
+      raasPassword: render-only
+      raasInsecureSkipVerify: true
+      enrolNamespaces: [team-alpha]
+      enrolAllNamespaces: false
+      enrolNamespaceSelector: ""
+      enrolKeyAcceptance: discovery
+      preseedKeys: false
+      scavengerExcludeMinions: saltmaster
+system:
+  vcfDepotFqdn: vcf-depot.kube-system.svc
+  vcfDepotCaChain: ""

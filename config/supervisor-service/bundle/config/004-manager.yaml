@@ -34,9 +34,6 @@ spec:
       - name: registry-credentials
       #@ end
       volumes:
-      #! VCF9 injects a spherelet-spagent sidecar that writes glog files under
-      #! /tmp. We keep the root filesystem read-only and expose /tmp as tmpfs
-      #! so the sidecar (and any transient files) can write without privileges.
       - name: tmp
         emptyDir: {}
       containers:
@@ -47,11 +44,26 @@ spec:
         args:
         - --leader-elect
         - --health-probe-bind-address=:8081
-        #! Metrics endpoint disabled on the Supervisor (no cert-manager).
         - --metrics-bind-address=0
+        - #@ "--default-connection-secret={}".format(data.values.raas.connectionSecret)
+        #@ if len(data.values.enrolment.namespaces) > 0:
+        - #@ "--enrol-namespaces={}".format(",".join(data.values.enrolment.namespaces))
+        #@ end
+        #@ if data.values.enrolment.all:
+        - --enrol-all-namespaces
+        #@ end
+        #@ if data.values.enrolment.namespaceSelector != "":
+        - #@ "--enrol-namespace-selector={}".format(data.values.enrolment.namespaceSelector)
+        #@ end
+        #@ if data.values.enrolment.excludePrefixes != "":
+        - #@ "--enrol-exclude-prefixes={}".format(data.values.enrolment.excludePrefixes)
+        #@ end
+        - #@ "--enrol-key-acceptance={}".format(data.values.enrolment.keyAcceptance)
         env:
-        - name: RAAS_DEFAULT_INSECURE_SKIP_VERIFY
-          value: #@ "{}".format(data.values.raas.defaultInsecureSkipVerify).lower()
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         volumeMounts:
         - name: tmp
           mountPath: /tmp

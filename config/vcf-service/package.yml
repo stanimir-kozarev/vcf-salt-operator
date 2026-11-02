@@ -1,0 +1,105 @@
+---
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: PackageMetadata
+metadata:
+  name: ""
+  labels:
+    services.vcfa.broadcom.com/can-auto-scale-regions: "true"
+    services.vcfa.broadcom.com/can-auto-scale-supervisors: "true"
+spec:
+  displayName: "VCF Salt Operator"
+  shortDescription: "Salt minion key lifecycle for VMs on VCF Supervisors"
+  longDescription: |
+    Accepts the Salt minion key of each VM Service VM as it is created, runs its first
+    configuration through VMware Salt, applies Day-2 configuration changes from Git,
+    and deletes the key when the VM is deleted. One RaaS connection per Supervisor is
+    set here, so tenant namespaces hold no RaaS credentials.
+  providerName: stanimir-kozarev
+---
+apiVersion: data.packaging.carvel.dev/v1alpha1
+kind: Package
+metadata:
+  name: ""
+spec:
+  refName: ""
+  version: ""
+  valuesSchema:
+    openAPIv3:
+      title: vcf-salt-operator service values schema
+      type: object
+      properties:
+        system:
+          type: object
+          description: VCF Service Autowired Properties.
+          properties:
+            vcfDepotFqdn:
+              type: string
+              description: Depot FQDN the platform autowires.
+              default: vcf-depot.kube-system.svc
+            vcfDepotCaChain:
+              type: string
+              description: Depot CA chain the platform autowires.
+              default: ""
+        regions:
+          type: array
+          description: Regions and the Supervisors within them to install onto.
+          items:
+            type: object
+            required: [name, supervisors]
+            properties:
+              name:
+                type: string
+              supervisors:
+                type: array
+                items:
+                  type: string
+              configuration:
+                type: object
+                properties:
+                  raasURL:
+                    type: string
+                    description: Base URL of the VMware Salt RaaS API, for example https://salt.example:443.
+                    default: ""
+                  raasMasterID:
+                    type: string
+                    description: Salt master ID as registered in VMware Salt.
+                    default: ""
+                  raasUsername:
+                    type: string
+                    default: ""
+                  raasPassword:
+                    type: string
+                    format: password
+                    default: ""
+                  raasInsecureSkipVerify:
+                    type: boolean
+                    description: Skip TLS verification of the RaaS endpoint. Leave false in production.
+                    default: false
+                  enrolNamespaces:
+                    type: array
+                    description: Namespaces the operator enrols itself with the default connection.
+                    items:
+                      type: string
+                    default: []
+                  enrolAllNamespaces:
+                    type: boolean
+                    description: Enrol every tenant namespace. System namespaces are always excluded.
+                    default: false
+                  enrolNamespaceSelector:
+                    type: string
+                    description: Label selector for namespaces to enrol.
+                    default: ""
+                  enrolKeyAcceptance:
+                    type: string
+                    description: How enrolled namespaces accept minion keys. preseed generates each VM's key before it boots and lets the operator create, update and patch Secrets, never read them.
+                    enum: [discovery, preseed]
+                    default: discovery
+                  preseedKeys:
+                    type: boolean
+                    description: Let the operator create, update and patch Secrets, never read them, for team SaltKeyConfigs that set keyAcceptance preseed. Not needed when enrolKeyAcceptance is preseed.
+                    default: false
+                  scavengerExcludeMinions:
+                    type: string
+                    description: Comma-separated glob patterns of minion IDs the stale key scavenger never reports or deletes, such as the master's own minion.
+                    default: ""
+      required: [regions]

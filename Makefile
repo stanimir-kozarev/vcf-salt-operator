@@ -160,11 +160,8 @@ build-installer-vcf9: manifests generate kustomize ## Generate minimal install b
 
 ##@ Supervisor Service (VCF9)
 
-# Release version for the Supervisor Service bundle + Package.
-VERSION          ?= 0.2.2
-# Service ID — must match PackageMetadata.metadata.name in config/supervisor-service/package/.
+VERSION          ?= 0.5.0
 SERVICE_ID       ?= vcf-salt-operator.salt.vcf.io
-# OCI bundle published by `make supervisor-bundle`.
 BUNDLE_IMG       ?= ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:$(VERSION)
 SUPSVC_SRC       := config/supervisor-service
 SUPSVC_BUNDLE    := $(SUPSVC_SRC)/bundle
@@ -187,8 +184,6 @@ supervisor-bundle: supervisor-crd-sync ## Build and push the imgpkg bundle to BU
 	@command -v imgpkg >/dev/null 2>&1 || { echo "imgpkg not found. Install Carvel imgpkg."; exit 1; }
 	@command -v kbld   >/dev/null 2>&1 || { echo "kbld not found. Install Carvel kbld.";     exit 1; }
 	@command -v ytt    >/dev/null 2>&1 || { echo "ytt not found. Install Carvel ytt.";       exit 1; }
-	@# Bake the build-time image ref into the bundle so deploy-time ytt renders the same
-	@# literal that kbld will later find in the (relocated) ImagesLock.
 	@img_repo="$$(printf '%s\n' '$(IMG)' | sed -E 's/:[^:/]+$$//')"; \
 	img_tag="$$(printf  '%s\n' '$(IMG)' | sed -E 's#.*:##')";  \
 	printf '#@data/values\n#@overlay/match missing_ok=True\n---\nimage:\n  repository: %s\n  tag: "%s"\n' \
@@ -358,7 +353,7 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
-GOLANGCI_LINT_VERSION ?= v2.8.0
+GOLANGCI_LINT_VERSION ?= v2.15.0
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -411,3 +406,135 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ VCF Service (VCF 9.1) and lab builds
+
+LAB_REGISTRY     ?=
+SS_BUNDLE_DEST   ?= $(if $(LAB_REGISTRY),$(LAB_REGISTRY)/vcf-salt-operator-bundle)
+REGISTRY_PORT    ?= 5050
+LOCAL_REGISTRY   ?= localhost:$(REGISTRY_PORT)
+LOCAL_IMG        ?= $(LOCAL_REGISTRY)/vcf-salt-operator:$(VERSION)
+LOCAL_BUNDLE_IMG ?= $(LOCAL_REGISTRY)/vcf-salt-operator-bundle:$(VERSION)
+LOCAL_SERVICE_IMG ?= $(LOCAL_REGISTRY)/vcf-salt-operator-vcfservice:$(VERSION)
+SERVICE_IMG      ?= $(LOCAL_SERVICE_IMG)
+VS               := config/vcf-service
+VS_DIST          := dist/vcf-service
+SS_PKG_DIST      := dist/ss-package
+
+.PHONY: build-linux
+build-linux: manifests generate fmt vet ## Cross-compile the manager and scavenger for linux/amd64 into bin/linux-amd64.
+	@mkdir -p bin/linux-amd64
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/linux-amd64/manager ./cmd/main.go
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/linux-amd64/scavenger ./cmd/scavenger/main.go
+
+.PHONY: image-prebuilt
+image-prebuilt: build-linux ## Build the linux/amd64 image as IMG from the host-built binaries. No emulation.
+	$(CONTAINER_TOOL) build --platform=linux/amd64 -f Dockerfile.prebuilt -t $(IMG) bin/linux-amd64
+
+.PHONY: local-registry
+local-registry: ## Start a throwaway local registry for building bundles offline.
+	-$(CONTAINER_TOOL) rm -f vcf-salt-registry
+	$(CONTAINER_TOOL) run -d --name vcf-salt-registry -p $(REGISTRY_PORT):5000 docker.io/library/registry:2
+	@sleep 3 && curl -s http://$(LOCAL_REGISTRY)/v2/ -o /dev/null -w 'registry http=%{http_code}\n'
+
+.PHONY: local-registry-stop
+local-registry-stop: ## Remove the throwaway registry.
+	-$(CONTAINER_TOOL) rm -f vcf-salt-registry
+
+.PHONY: vcf-service-package
+vcf-service-package: ## Stamp VERSION into the payload Package, pinned to SS_BUNDLE_DEST at the built bundle's digest when a lock exists.
+	@mkdir -p $(SS_PKG_DIST)
+	@sed 's/__VERSION__/$(VERSION)/g' $(SUPSVC_PKG_DIR)/package.yaml > $(SS_PKG_DIST)/package.yaml
+	@cp $(SUPSVC_PKG_DIR)/package-metadata.yaml $(SS_PKG_DIST)/package-metadata.yaml
+	@if [ -f dist/supervisor-bundle.lock.yml ] && [ -n "$(SS_BUNDLE_DEST)" ]; then \
+		digest=$$(awk '/image:/{print $$2; exit}' dist/supervisor-bundle.lock.yml | sed 's#.*@##'); \
+		sed -i.bak -E "s#^( *image: ).*vcf-salt-operator-bundle.*#\1$(SS_BUNDLE_DEST)@$$digest#" $(SS_PKG_DIST)/package.yaml; \
+		rm -f $(SS_PKG_DIST)/package.yaml.bak; \
+		echo "pinned payload bundle to $(SS_BUNDLE_DEST)@$$digest"; \
+	else \
+		echo "no dist/supervisor-bundle.lock.yml or no LAB_REGISTRY, payload bundle left at its tag (render only)"; \
+	fi
+
+.PHONY: supervisor-service-yaml-lab
+supervisor-service-yaml-lab: vcf-service-package ## Emit the vCenter Service YAML pinned to SS_BUNDLE_DEST, for a standalone Supervisor Service install.
+	@{ cat $(SS_PKG_DIST)/package-metadata.yaml; echo; cat $(SS_PKG_DIST)/package.yaml; } \
+		> dist/vcf-salt-operator-supervisorservice-$(VERSION)-lab.yaml
+	@echo "wrote dist/vcf-salt-operator-supervisorservice-$(VERSION)-lab.yaml"
+
+.PHONY: vcf-service-deps
+vcf-service-deps: vcf-service-package ## Generate the data values carrying the payload Package and PackageMetadata.
+	@{ \
+	  echo '#@data/values'; \
+	  echo '#@overlay/match-child-defaults missing_ok=True'; \
+	  echo '---'; \
+	  echo 'dependencies:'; \
+	  echo '  package:'; \
+	  sed '/^---$$/d; /^[[:space:]]*#/d' $(SS_PKG_DIST)/package.yaml | sed 's/^/    /'; \
+	  echo '  packageMetadata:'; \
+	  sed '/^---$$/d; /^[[:space:]]*#/d' $(SS_PKG_DIST)/package-metadata.yaml | sed 's/^/    /'; \
+	} > dist/deps.yml
+
+.PHONY: vcf-service-render
+vcf-service-render: vcf-service-deps ## Render the VCF Service CRs locally with the example values. No registry needed.
+	ytt -f $(VS)/config --data-values-file $(VS)/.values/render.yml -f dist/deps.yml
+
+.PHONY: vcf-service-build
+vcf-service-build: vcf-service-deps ## Build the VCF Service bundle directory into dist/vcf-service.
+	@rm -rf $(VS_DIST) && mkdir -p $(VS_DIST)
+	@cp -R $(VS)/config $(VS)/.imgpkg $(VS)/.values $(VS_DIST)/
+	@cp dist/deps.yml $(VS_DIST)/config/zz-dependencies.yml
+	@sed -e 's/^  name: ""/  name: $(SERVICE_ID).$(VERSION)/' \
+	     -e 's/^  refName: ""/  refName: $(SERVICE_ID)/' \
+	     -e 's/^  version: ""/  version: $(VERSION)/' \
+	     $(VS)/package.yml > $(VS_DIST)/package.yml
+	ytt -f $(VS_DIST)/config --data-values-file $(VS)/.values/render.yml > /dev/null
+	ytt -f $(VS_DIST)/.values/transpiler.yml --data-values-file $(VS)/.values/render.yml > /dev/null
+	@echo "built $(VS_DIST)"
+
+.PHONY: vcf-service-push
+vcf-service-push: vcf-service-build ## Push the VCF Service bundle to SERVICE_IMG.
+	imgpkg push -b $(SERVICE_IMG) -f $(VS_DIST) --lock-output dist/vcf-service.lock.yml
+
+.PHONY: vcf-service-tar
+vcf-service-tar: ## Pack the pushed VCF Service bundle into a self-contained tar for upload.
+	imgpkg copy -b $(SERVICE_IMG) --to-tar dist/$(SERVICE_ID)-$(VERSION).tar
+	@ls -lh dist/$(SERVICE_ID)-$(VERSION).tar
+
+.PHONY: vcf-service-release
+vcf-service-release: ## Build the VCF Service bundle with the payload pinned to SS_BUNDLE_DEST by digest, push it to SERVICE_IMG and pack the upload tar. Needs dist/supervisor-bundle.lock.yml.
+	@[ -n "$(SS_BUNDLE_DEST)" ] || { echo "set SS_BUNDLE_DEST to the published payload bundle repository" >&2; exit 1; }
+	@[ -f dist/supervisor-bundle.lock.yml ] || { echo "missing dist/supervisor-bundle.lock.yml, run make supervisor-bundle first" >&2; exit 1; }
+	$(MAKE) vcf-service-build VERSION=$(VERSION) SS_BUNDLE_DEST=$(SS_BUNDLE_DEST)
+	@grep -q "image: $(SS_BUNDLE_DEST)@sha256:" $(VS_DIST)/config/zz-dependencies.yml || { echo "the VCF Service payload is not pinned to $(SS_BUNDLE_DEST) by digest" >&2; exit 1; }
+	$(MAKE) vcf-service-push vcf-service-tar VERSION=$(VERSION) SS_BUNDLE_DEST=$(SS_BUNDLE_DEST) SERVICE_IMG=$(SERVICE_IMG)
+
+.PHONY: render-check
+render-check: supervisor-crd-sync vcf-service-deps ## Render all three install modes offline and assert their permission shape.
+	hack/render-check.sh
+
+.PHONY: lab-build
+lab-build: ## Build everything a lab needs into dist/, through a throwaway local registry. Needs podman and LAB_REGISTRY.
+	@[ -n "$(SS_BUNDLE_DEST)" ] || { echo "set LAB_REGISTRY to the registry project the payload is imported into, such as registry.example.com/platform" >&2; exit 1; }
+	$(MAKE) local-registry CONTAINER_TOOL=$(CONTAINER_TOOL)
+	$(MAKE) image-prebuilt IMG=$(LOCAL_IMG) CONTAINER_TOOL=$(CONTAINER_TOOL)
+	$(CONTAINER_TOOL) push --tls-verify=false $(LOCAL_IMG)
+	$(MAKE) supervisor-bundle IMG=$(LOCAL_IMG) BUNDLE_IMG=$(LOCAL_BUNDLE_IMG)
+	imgpkg copy -b $(LOCAL_BUNDLE_IMG) --to-tar dist/vcf-salt-operator-payload-$(VERSION).tar
+	$(MAKE) supervisor-service-yaml-lab VERSION=$(VERSION)
+	$(MAKE) vcf-service-release VERSION=$(VERSION) SS_BUNDLE_DEST=$(SS_BUNDLE_DEST) SERVICE_IMG=$(LOCAL_SERVICE_IMG)
+	$(MAKE) local-registry-stop CONTAINER_TOOL=$(CONTAINER_TOOL)
+	@echo
+	@ls -lh dist/vcf-salt-operator-payload-$(VERSION).tar dist/$(SERVICE_ID)-$(VERSION).tar \
+		dist/vcf-salt-operator-supervisorservice-$(VERSION)-lab.yaml
+
+.PHONY: local-e2e-up
+local-e2e-up: ## Create the local e2e rig: kind on podman, a TLS registry, kapp-controller and a Salt minion image.
+	hack/local-e2e.sh up
+
+.PHONY: local-e2e
+local-e2e: ## Install the lab build in both modes and run a VM through real RaaS. Needs VERSION and RAAS_URL, RAAS_MASTER_ID, RAAS_USERNAME, RAAS_PASSWORD.
+	VERSION=$(VERSION) hack/local-e2e.sh test
+
+.PHONY: local-e2e-down
+local-e2e-down: ## Remove the local e2e rig.
+	hack/local-e2e.sh down

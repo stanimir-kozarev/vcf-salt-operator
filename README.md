@@ -12,6 +12,21 @@ Kubernetes operator and does not support plain Kind or kubeadm clusters.
 
 Version history is in [CHANGELOG.md](CHANGELOG.md).
 
+## Platform support
+
+| Platform | Installed as | Status |
+|---|---|---|
+| VCF 9.1.1 | [VCF Service](#deploy-as-a-vcf-service-vcf-91), from VCF Automation | Tested in 0.5.0, including in-place upgrade, key accept, preseeded keys, early key clear, highstate and key deletion |
+| VCF 9.1.1 | [Supervisor Service](#deploy-as-a-vcf9-supervisor-service), from vCenter | Expected to work, not tested |
+| VCF 9.1.0 | VCF Service, from VCF Automation | Tested with 0.4.0 release candidates, including in-place upgrades and Day-2 runs |
+| VCF 9.1.0 | Supervisor Service, from vCenter | Tested with 0.4.0 release candidates |
+| VCF 9.0.x | Supervisor Service, from vCenter | Expected to work, not tested |
+| VCF 9.0.x | VCF Service | Not available, VCF Services start with VCF 9.1 |
+
+Tested platforms get fixes. Untested ones are expected to work because the Supervisor Service install
+uses only the `v1alpha4` VirtualMachine API and objects in the operator's own namespace, and fixes for
+them are best effort. VCF 9.0.x support may end in a future release.
+
 ---
 
 ## Full VM lifecycle
@@ -30,7 +45,10 @@ cluster-wide. For each VM annotated `salt.vcf.io/managed=true` it:
    the VM object is garbage-collected.
 
 If no pending key appears within `acceptTimeout` (default `10m`) the VM is marked
-`salt.vcf.io/key-status=Failed` and the operator stops retrying.
+`salt.vcf.io/key-status=Failed`, with one `SaltKeyTimeout` event, and the operator stops
+polling. The VM is not given up on: whenever it is reconciled again, for example after an
+operator restart, a VM update or a `salt.vcf.io/retry-request`, a matching pending key is
+accepted and the chain continues.
 
 ### Phase 2 — Bootstrap chain
 
@@ -123,9 +141,9 @@ When a VM's `DeletionTimestamp` is set the finalizer fires:
 
 | Annotation | Values | Description |
 |---|---|---|
-| `salt.vcf.io/key-status` | `Accepted` · `Failed` · `Deleted` · `DeleteFailed` | Key acceptance lifecycle state |
+| `salt.vcf.io/key-status` | `Preseeded` · `Accepted` · `Failed` · `Deleted` · `DeleteFailed` | Key acceptance lifecycle state. `Preseeded` means the key is accepted and waiting for the VM to run |
 | `salt.vcf.io/minion-id` | string | Salt minion ID matched and accepted |
-| `salt.vcf.io/match-method` | `name` · `ip` · `shifted-ip` · `prefix` | Matching strategy used |
+| `salt.vcf.io/match-method` | `name` · `ip` · `shifted-ip` · `prefix` · `preseed` | Matching strategy used, or `preseed` for a key the operator generated |
 | `salt.vcf.io/salt-status` | See phase table above | Post-accept bootstrap phase |
 | `salt.vcf.io/ready` | `true` · `false` | Salt management fully complete and healthy |
 | `salt.vcf.io/highstate-jid` | JID string | JID of the running or last completed highstate |
@@ -134,6 +152,7 @@ When a VM's `DeletionTimestamp` is set the finalizer fires:
 | `salt.vcf.io/highstate-failed-count` | integer string | Number of failed states (`0` = all succeeded) |
 | `salt.vcf.io/highstate-failed-states` | comma-separated state IDs | Failed state identifiers — contains only state map keys, never rendered values or secrets |
 | `salt.vcf.io/roles-hash` | hex string, `v2:`-prefixed | Hash of the full tenant-set `salt.vcf.io/*` intent-annotation set at last highstate dispatch |
+| `salt.vcf.io/key-cleared` | `true` | Preseed only. The private key in `<vm>-salt-bootstrap` was replaced after the first successful `test.ping` |
 | `salt.vcf.io/accepted-at` | RFC3339 timestamp | When the key was accepted; drives grace period and retry window |
 | `salt.vcf.io/retry-handled` | string | Last `salt.vcf.io/retry-request` value the operator acted on |
 | `salt.vcf.io/bulk-retry-handled` | string | Last `SaltKeyConfig.spec.retryToken` value this VM acted on |
@@ -166,9 +185,119 @@ The operator tries four strategies in order, stopping at the first match:
 
 ---
 
+## Preseeded keys
+
+With `keyAcceptance: preseed` on a `SaltKeyConfig` the operator never matches pending keys
+in that namespace. It follows Salt's preseed practice instead:
+
+1. When a managed VM appears, before it boots, the operator asks the master through RaaS
+   to generate a key pair for the minion ID and accept it (`key.gen_accept`). The minion
+   ID is the VM name.
+2. It writes the Secret `<vm>-salt-bootstrap`, owned by the VM, with `minion.pem`,
+   `minion.pub`, `minion_master.pub` and `minion_id`, and marks the VM
+   `salt.vcf.io/key-status=Preseeded`.
+3. The VM's cloud-init places the four files before the minion starts. The minion
+   authenticates with a key the master already trusts and refuses any master whose key
+   differs from `minion_master.pub`.
+4. When the VM runs with an IP the key status becomes `Accepted` and the bootstrap chain
+   starts as usual.
+5. The operator sets `minion.pem` and `minion.pub` in the Secret to `cleared` and marks
+   the VM `salt.vcf.io/key-cleared=true`, once, on whichever comes first:
+   - the guest's signal that the files are written (see below),
+   - the first successful `test.ping`,
+   - `acceptTimeout` after VM creation, or a final ping failure. A VM still not running
+     with an IP by then is marked `key-status=Failed` with event `SaltKeyTimeout` and must
+     be recreated, which gives it a new key.
+
+   Event `SaltKeyCleared` names the trigger. The VM update makes VM Operator render the
+   VM's cloud-init data again, now without the private key. Cloud-init writes files once
+   per VM instance, so the minion keeps its key through reboots and power cycles.
+
+A host that guesses the minion ID and presents its own key is denied by the master. The
+VM manifest references the Secret, which only the operator creates, so VM Operator waits
+for it before the VM boots. Use the structured `cloudConfig` with `write_files`, since a
+`rawCloudConfig` cannot take files from a second Secret:
+
+```yaml
+spec:
+  readinessProbe:
+    guestInfo:
+    - key: salt-key-written
+  bootstrap:
+    cloudInit:
+      cloudConfig:
+        runcmd:
+        - vmtoolsd --cmd "info-set guestinfo.salt-key-written 1"
+        write_files:
+        - path: /etc/salt/pki/minion/minion.pem
+          permissions: "0400"
+          content: {name: <vm>-salt-bootstrap, key: minion.pem}
+        - path: /etc/salt/pki/minion/minion.pub
+          content: {name: <vm>-salt-bootstrap, key: minion.pub}
+        - path: /etc/salt/pki/minion/minion_master.pub
+          content: {name: <vm>-salt-bootstrap, key: minion_master.pub}
+        - path: /etc/salt/minion_id
+          content: {name: <vm>-salt-bootstrap, key: minion_id}
+```
+
+The image must not carry a Salt key, a minion ID or a cached master key, and nothing in
+cloud-init may delete `/etc/salt/pki` after `write_files`.
+
+The `readinessProbe` and the `runcmd` line are optional and give the guest signal. Keep
+the `vmtoolsd` line first in `runcmd`. cloud-init runs `runcmd` after `write_files`, so
+the key `guestinfo.salt-key-written` means the files are on disk. VM Operator then sets
+the VM condition `Ready=True`, and the operator clears the key, usually minutes before
+the first ping. It honours `Ready=True` only from a probe on `salt-key-written` and only
+the first time, so a later change of the key or the condition does nothing.
+
+Without further settings any process in the guest can set that key, and a non-root
+process could make the operator clear the Secret before cloud-init has read it. That VM
+then never works, but no key is exposed. Set the VM configuration parameter
+`guest_rpc.rpci.auth.cmd.info-set = "TRUE"` in the VM class, under
+`spec.configSpec.extraConfig`, so that only root can set GuestInfo keys and only through
+`vmtoolsd --cmd` (Broadcom KB 377294). cloud-init keeps working with it and logs refused
+writes of the `guestinfo.local-ipv4` and `local-ipv6` values it publishes. Do not set the
+companion `guest_rpc.rpci.auth.cmd.info-get`: cloud-init 23.1.1, as on Photon OS 5, reads
+GuestInfo only through `vmware-rpctool`, which that parameter refuses, so the VM boots
+with no network and no files.
+
+Key state rules:
+
+| Found on the master for the minion ID | Operator action |
+|---|---|
+| The VM already shows `key-status=Accepted` | Keeps the key. A namespace switching from discovery adopts its running VMs |
+| Another VM records this minion ID | Generates nothing, marks the VM `Failed` with event `SaltMinionIDInUse`, or waits while that VM is being deleted |
+| No key, or only a denied one | Generates a key |
+| A pending or rejected key | Replaces it and raises event `SaltForeignKeyReplaced` |
+| An accepted key no VM records | Replaces it, the recreated VM case |
+
+Preseed for enrolled namespaces needs only `enrolment.keyAcceptance: preseed`, or
+`enrolKeyAcceptance` in the VCF Service install form (see Automatic enrolment). For a team's
+own `SaltKeyConfig` it needs install value `rbac.preseedKeys: true`, or `preseedKeys` in the VCF Service
+install form, which grants the operator cluster-wide create, update and patch of Secrets, never
+read. The private key is part of the RaaS job result and stays in the RaaS database.
+
+VM Operator delivers the rendered cloud-init data, Secret content included, to the guest
+as `guestinfo.userdata`, which any process in the guest can read through VMware Tools and
+any vCenter user with a permission on the VM, the `Read-only` role included, can read in
+its advanced settings or through the API. Step 5 limits that exposure of the private
+key to the time from VM creation to the guest signal or the first `test.ping`, and to
+`acceptTimeout` at most.
+
+The minion trusts only the master key in `minion_master.pub`. If the master's key changes,
+preseeded minions refuse it until that file is replaced on each of them. Masters that share
+one key pair pass this check. The minion's key is accepted on the master named by the RaaS
+connection, so with several masters the others must share its minion keys, as a Salt master
+cluster does through `cluster_pki_dir`. Several masters are not tested yet.
+
+---
+
 ## SaltKeyConfig reference
 
-One `SaltKeyConfig` per enrolled namespace connects the operator to a RaaS endpoint.
+One `SaltKeyConfig` per enrolled namespace connects the operator to a RaaS endpoint. It
+either uses the operator's default connection, set in the install values under
+`raas.connection`, or names a credentials Secret in its own namespace. With the default
+connection every field is optional and `spec: {}` is enough.
 
 ```yaml
 apiVersion: salt.vcf.io/v1alpha1
@@ -177,25 +306,39 @@ metadata:
   name: default
   namespace: <tenant-namespace>
 spec:
-  raasURL: https://<raas-host>          # RaaS API base URL
-  masterID: <salt-master-id>            # Salt master ID registered in RaaS
-  credentialsSecret: <secret-name>      # Secret with keys: username, password
+  raasURL: https://<raas-host>          # RaaS API base URL. Optional with the default connection
+  masterID: <salt-master-id>            # Salt master ID registered in RaaS. Optional with the default connection
+  credentialsSecret: <secret-name>      # Secret with keys username and password. Empty uses the default connection
   skipTLSVerify: false                  # Set true for self-signed RaaS certificates
-  acceptTimeout: "10m"                  # How long to wait for a pending key before marking Failed
+  keyAcceptance: discovery              # discovery or preseed, see Preseeded keys
+  vmSelector:                           # Optional. Only annotated VMs matching it are onboarded
+    matchLabels:
+      salt: enabled
+  acceptTimeout: "10m"                  # Pending key wait, and in preseed the latest key clear
   requeueInterval: "30s"               # How often to re-check for pending keys
   retryToken: ""                        # Any new value retries every Failed/<step> VM in this namespace
   enforcementInterval: ""               # e.g. "24h". Re-runs a Ready VM whose last highstate is older. Empty disables
 ```
 
-The `SaltKeyConfigReconciler` validates the referenced Secret and sets
-`status.conditions[Ready=True]`. The VM reconciler only acts in namespaces where this
-condition is met.
+The `SaltKeyConfigReconciler` resolves the connection and sets
+`status.conditions[Ready=True]`. On the default connection the message reads "Using the
+operator's default RaaS connection" and states the TLS mode. A config on the default
+connection may restate its URL and master ID. One that names another URL or master, or
+asks to skip TLS verification the default does not allow, is refused with reason
+`ConnectionMismatch`. A config waiting for its Secret is checked again every 30 seconds
+and turns `Ready` on its own once the Secret is there. The VM reconciler only acts in
+namespaces where this condition is met.
+
+`vmSelector` limits which annotated VMs in the namespace are onboarded. A VM that is
+being deleted always has its key removed, whatever the selector, so narrowing it never
+strands a key. An invalid selector sets `Ready=False` with reason `InvalidSelector`.
 
 ---
 
 ## Prerequisites
 
 - **VCF9 Supervisor** with VM Service enabled (API group `vmoperator.vmware.com/v1alpha4`).
+  See [Platform support](#platform-support) for the versions each release is tested on.
 - **VCF Salt RaaS** instance reachable from the Supervisor worker nodes.
 - **Container registry** reachable from the Supervisor — public
   (`ghcr.io/stanimir-kozarev/vcf-salt-operator`) or private (see air-gap path below).
@@ -213,6 +356,9 @@ VCF9 Supervisor users cannot create cluster-scoped RBAC resources directly. The
 operator must be installed by a vSphere administrator as a **Supervisor Service** via
 the vSphere Client. The Carvel kapp-controller bundled in the Supervisor applies the
 manifests with the elevated permissions the service package declares.
+
+On VCF 9.1 the same release can instead be installed from VCF Automation, see
+[Deploy as a VCF Service](#deploy-as-a-vcf-service-vcf-91).
 
 Set these variables once for your environment before running any command below:
 
@@ -290,8 +436,18 @@ imagePullSecret:
   dockerconfigjson: "<base64-encoded-dockerconfigjson>"
 
 raas:
-  defaultInsecureSkipVerify: false   # set true if RaaS uses a self-signed certificate
+  connection:                        # the default RaaS connection, see Enrol a namespace
+    url: https://<raas-host>
+    masterID: <salt-master-id>
+    username: <raas-username>
+    password: <raas-password>
+    insecureSkipVerify: false        # set true if RaaS uses a self-signed certificate
 ```
+
+Every value is optional. `config/supervisor-service/sample-values.yaml` lists them all,
+including `enrolment`, `scavenger.excludeMinions` and `rbac.tenantCredentialSecrets`. The
+values schema in `config/supervisor-service/package/package.yaml` describes each one, and
+vCenter shows those descriptions on install.
 
 Generate the `dockerconfigjson` value on your build host:
 
@@ -451,7 +607,12 @@ imagePullSecret:
   dockerconfigjson: "<base64-encoded-dockerconfigjson>"
 
 raas:
-  defaultInsecureSkipVerify: false
+  connection:
+    url: https://<raas-host>
+    masterID: <salt-master-id>
+    username: <raas-username>
+    password: <raas-password>
+    insecureSkipVerify: false
 ```
 
 Paste the edited YAML into **YAML Service Config** and complete the install.
@@ -469,17 +630,106 @@ kubectl get crd saltkeyconfigs.salt.vcf.io
 
 Expected: pod `controller-manager-*` in `Running`; log lines show both controllers
 starting (`"controller": "saltkeyconfig"` and `"controller": "virtualmachine"`);
-CRD `saltkeyconfigs.salt.vcf.io` present cluster-wide.
+CRD `saltkeyconfigs.salt.vcf.io` present cluster-wide. The first log lines also show the
+default connection's URL, master ID and TLS setting, or why it is not usable yet.
+
+### Upgrade
+
+In the vSphere Client add the new version to the existing service, then upgrade the
+Supervisor's install to it. Do not uninstall first: uninstalling the service deletes
+every `SaltKeyConfig` on the Supervisor.
+
+From 0.3.x, namespaces with their own credentials Secret stay `Ready`, since
+`rbac.tenantCredentialSecrets` defaults to true. A `SaltKeyConfig` that sets
+`spec.vmSelector`, which 0.3.x ignored, onboards only the VMs it matches from 0.4.0 on.
+
+---
+
+## Deploy as a VCF Service (VCF 9.1)
+
+On VCF 9.1, VCF Automation installs partner services as VCF Services on the Supervisors of
+a region, from one bundle uploaded in Provider Management, Service Management, Partner
+Services. The release attaches `vcf-salt-operator.salt.vcf.io-<version>.tar` for this. It
+wraps the same Carvel payload as the Supervisor Service.
+
+What differs from the Supervisor Service:
+
+- The bundle is unsigned, so VCF Automation shows a warning on upload. VCF 9.1 refuses an
+  unsigned service's cluster-wide Secret reads, so every namespace uses the default
+  connection and `rbac.tenantCredentialSecrets` is false.
+- On VCF Automation 9.1.0 and 9.1.1 the install form does not pass its values to the
+  service. Set the install values through the Service Manager API, and send them again to
+  each new version after an upgrade, since values are stored per version.
+- The Supervisor Service and the VCF Service share a service ID. Moving from one to the
+  other means uninstalling and deleting the Supervisor Service first, which deletes every
+  `SaltKeyConfig`. Re-apply enrolment from Git afterwards, or use automatic enrolment.
+
+[`config/vcf-service/README.md`](config/vcf-service/README.md) has the steps, the API
+calls and the platform behaviour measured on VCF 9.1.
 
 ---
 
 ## Enrol a namespace
 
-Each Supervisor namespace that should have its VMs managed needs:
+A namespace is enrolled by a `SaltKeyConfig` in it. There are three ways to get one there.
+
+### With the default connection
+
+When the install values set `raas.connection`, a namespace needs only an empty
+`SaltKeyConfig`, with no Secret and no RBAC grant:
+
+```bash
+TENANT_NS=<tenant-namespace>
+kubectl apply -f - <<EOF
+apiVersion: salt.vcf.io/v1alpha1
+kind: SaltKeyConfig
+metadata:
+  name: default
+  namespace: ${TENANT_NS}
+spec: {}
+EOF
+```
+
+Expected: condition `Ready=True` with the message "Using the operator's default RaaS
+connection, TLS verification on". This keeps RaaS credentials out of tenant namespaces.
+
+### Automatic enrolment
+
+Install values under `enrolment` let the operator create the `SaltKeyConfig` itself, named
+`salt-config` and using the default connection:
+
+```yaml
+enrolment:
+  namespaces: [team-a, team-b]   # by name
+  all: false                     # or every namespace
+  namespaceSelector: ""          # or by label, for example salt=enabled
+  keyAcceptance: discovery       # or preseed, see Preseeded keys
+```
+
+Enrolment is off by default. Namespaces whose names start with `kube-`, `vmware-system-`,
+`svc-`, `tkg-system` or `kapp-controller` are never enrolled, and a non-empty
+`excludePrefixes` replaces that list. A namespace that already has a `SaltKeyConfig` is
+left alone, and when a team adds its own later, the operator removes `salt-config`.
+Removing a namespace from enrolment, or turning enrolment off, deletes only the configs
+the operator created, those labelled `salt.vcf.io/managed-by=vcf-salt-operator`.
+
+`keyAcceptance` sets the mode of every `salt-config` the operator creates, and changing it
+changes them in place. Running VMs keep their keys either way. With `preseed` the install
+also grants the operator create, update and patch of Secrets, never read, so `rbac.preseedKeys`
+is not needed. A team's own `SaltKeyConfig` keeps the mode it states. The VCF Service
+install form calls this value `enrolKeyAcceptance`.
+
+### With a credentials Secret per namespace
+
+Each namespace holds its own RaaS credentials:
 
 1. A `Secret` with RaaS credentials.
 2. A `SaltKeyConfig` pointing at the RaaS endpoint.
-3. A namespace-scoped RBAC grant so the operator can read the Secret.
+3. A namespace-scoped RBAC grant so the operator can read the Secret. Needed only when
+   `rbac.tenantCredentialSecrets` is false. By default the operator may `get` Secrets
+   cluster-wide.
+
+This route is not available on a VCF Service install.
 
 ```bash
 TENANT_NS=<tenant-namespace>
@@ -527,7 +777,8 @@ Expected: condition `Ready=True`.
 ## Opt a VM in
 
 Add `salt.vcf.io/managed=true` to the VM's annotations. The operator picks it up on
-the next watch event.
+the next watch event. If the namespace's `SaltKeyConfig` sets `spec.vmSelector`, the VM
+must match it too.
 
 For new VMs, set it in the manifest and include cloud-init configuration that installs
 and configures the salt-minion with the correct `minion_id` and master address:
@@ -761,7 +1012,12 @@ CR was recreated after its key was already accepted, which legitimately has no
 deleting it avoids acting on that false positive. Pass `--dry-run=false` to the
 CronJob's container args to enable deletion once the report has been reviewed.
 
-The Scavenger is included in the Supervisor Service bundle and requires no separate
+Minions with no VirtualMachine by design, such as the Salt master's own minion, are
+reported too, and would be deleted with `--dry-run=false`. List them in the install value
+`scavenger.excludeMinions` as comma-separated glob patterns, and the Scavenger never
+reports or deletes them.
+
+The Scavenger is included in the Supervisor Service bundle and needs no other
 configuration.
 
 ---
@@ -779,7 +1035,41 @@ configuration.
 | Minion registered under wrong ID despite correct `minion_id` file | VM image had `salt-minion` pre-installed with leftover `/etc/salt/pki` | The `runcmd` purge block in the VM manifest handles this — do not omit it |
 | `salt.vcf.io/salt-status=Failed/Ping` immediately after acceptance | Minion not yet reconnected after key acceptance | The 30s grace period handles this; if still failing, check that the VM can reach the Salt master on port 4505/4506 |
 | `SaltKeyConfig` stays `Ready=False` | RaaS unreachable or credentials wrong | Check `skipTLSVerify` for self-signed certs; verify credentials with `kubectl logs` on the operator pod |
+| `SaltKeyConfig` `Ready=False`, reason `ConnectionMismatch` | It names a RaaS URL or master other than the default, or asks to skip TLS verification the default does not allow | Remove `raasURL`, `masterID` and `skipTLSVerify`, or make them match the default |
+| `SaltKeyConfig` `Ready=False`, reason `SecretNotFound` | Its credentials Secret does not exist, or on the default connection the install values set no `raas.connection`, so `raas-connection` is missing from the operator's namespace | Create the Secret, or set `raas.connection` in the install values. The config is checked again every 30 seconds |
+| `SaltKeyConfig` `Ready=False`, reason `InvalidSelector` | `spec.vmSelector` is not a valid label selector | Fix the selector |
+| Event `SaltMasterSilent` on a VM | `test.ping` or `refresh_pillar` failed and the Salt master's presence record in RaaS did not change for a minute or more | The master is down or cut off from RaaS. Fix the master, then retry the VM with `salt.vcf.io/retry-request` |
 | Operator upgrade has no effect despite new image push | Same-tag push without bundle rebuild — Supervisor pulls old digest | Run the full build → bundle → service-yaml cycle and use **Upgrade** (not re-install) in vSphere Client |
+
+---
+
+## Development checks
+
+`make render-check` renders the operator offline with ytt for each install mode: Supervisor
+Service with and without the tenant Secret read, with preseed, and the VCF Service with and
+without preseed enrolment. It asserts each mode's Secret permissions and that the VCF Service
+install form offers every schema field and keeps the values a provider entered.
+
+`make local-e2e` installs a lab build through kapp-controller, the installer a Supervisor
+uses, into a kind cluster on podman, in both install modes. It runs VMs through discovery,
+preseed and the guest signal against a real RaaS, with a Salt minion container standing in
+for the guest. VM Operator, the Supervisor's service namespace, its signing rules and the
+install screens are not covered.
+
+```bash
+make local-e2e-up
+make lab-build VERSION=<version> LAB_REGISTRY=<registry>/<project>
+make local-e2e VERSION=<version> RAAS_URL=https://<raas-host> RAAS_MASTER_ID=<salt-master-id> \
+  RAAS_USERNAME=<user> RAAS_PASSWORD=<password>
+make local-e2e-down
+```
+
+| Variable | Meaning |
+|---|---|
+| `RAAS_INSECURE` | skip TLS verification of RaaS, default `true` |
+| `SALT_MASTER` | address the minion connects to, default the host of `RAAS_URL` |
+| `VM_NAME` | minion ID and VM name, default `e2e-vm-01` |
+| `SCAVENGER_EXCLUDE` | scavenger exclude globs, such as the master's own minion ID |
 
 ---
 

@@ -18,9 +18,6 @@ import (
 	"github.com/go-logr/logr"
 )
 
-// JIDResult holds the result of a Salt job execution for a single minion.
-// Return is kept as raw JSON because the shape differs per function:
-// test.ping / refresh_pillar return a bool; state.highstate returns a state map.
 type JIDResult struct {
 	MinionID string
 	JID      string
@@ -30,8 +27,6 @@ type JIDResult struct {
 	Success  bool
 }
 
-// BoolReturn extracts the return value as a boolean (for test.ping, refresh_pillar).
-// Returns (false, false) if the return value is not a boolean.
 func (r *JIDResult) BoolReturn() (bool, bool) {
 	var b bool
 	if err := json.Unmarshal(r.Return, &b); err != nil {
@@ -40,14 +35,10 @@ func (r *JIDResult) BoolReturn() (bool, bool) {
 	return b, true
 }
 
-// HighstateOK returns true when state.highstate completed with no failed states.
 func (r *JIDResult) HighstateOK() bool {
 	return r.Success && r.Retcode == 0
 }
 
-// FailedStateIDs returns a sorted list of state IDs whose result was false in a
-// state.highstate return map. Returns nil if the return is not a state map or all
-// states succeeded. Only the map keys (state IDs) are inspected — no values are read.
 func (r *JIDResult) FailedStateIDs() []string {
 	var states map[string]struct {
 		Result bool `json:"result"`
@@ -65,27 +56,32 @@ func (r *JIDResult) FailedStateIDs() []string {
 	return failed
 }
 
-// Client is the interface for Salt key management operations.
-// Implemented by RaaSClient; can be mocked in operator tests.
 type Client interface {
 	Login(ctx context.Context) error
 	ListPendingKeys(ctx context.Context) ([]string, error)
 	ListAcceptedKeys(ctx context.Context) ([]string, error)
 	AcceptKey(ctx context.Context, minionID string) error
 	DeleteKey(ctx context.Context, minionID string) error
-	// TestPing dispatches test.ping and waits for the result (context controls timeout).
 	TestPing(ctx context.Context, minionID string) (bool, error)
-	// RefreshPillar dispatches saltutil.refresh_pillar and waits for the result.
 	RefreshPillar(ctx context.Context, minionID string) (bool, error)
-	// DispatchHighstate dispatches state.highstate asynchronously and returns the JID.
-	// The caller should store the JID and poll with PollJID.
 	DispatchHighstate(ctx context.Context, minionID string) (string, error)
-	// PollJID checks whether a dispatched job has returned a result for the given minion.
-	// Returns (result, true, nil) when done; (nil, false, nil) when still running.
 	PollJID(ctx context.Context, minionID, jid string) (*JIDResult, bool, error)
+	MasterLastSeen(ctx context.Context) (string, error)
+	KeyStates(ctx context.Context, minionID string) ([]string, error)
+	GenAcceptKey(ctx context.Context, minionID string, force bool) (*KeyPair, error)
+	MasterPublicKey(ctx context.Context) (string, error)
 }
 
-// RaaSClient implements Client against the VCF Salt RaaS HTTP API.
+type jobArg struct {
+	Arg   []any          `json:"arg"`
+	Kwarg map[string]any `json:"kwarg"`
+}
+
+type KeyPair struct {
+	Pub  string `json:"pub"`
+	Priv string `json:"priv"`
+}
+
 type RaaSClient struct {
 	baseURL    string
 	username   string
@@ -95,13 +91,9 @@ type RaaSClient struct {
 	log        logr.Logger
 	mu         sync.RWMutex
 	jwt        string
+	masterPub  string
 }
 
-// NewRaaSClient creates a new RaaS client.
-// baseURL is the root of the VCF Salt RaaS API (e.g. "https://aria-config.corp:443").
-// masterID is the Salt master identifier (e.g. "saltstack_enterprise_installer").
-// Set skipTLSVerify=true for environments with self-signed certificates.
-// log is used for V(1) debug messages (API payloads/responses); pass logr.Discard() to suppress.
 func NewRaaSClient(baseURL, username, password, masterID string, skipTLSVerify bool, log logr.Logger) *RaaSClient {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLSVerify}, //nolint:gosec
@@ -121,18 +113,18 @@ func NewRaaSClient(baseURL, username, password, masterID string, skipTLSVerify b
 	}
 }
 
-// Login authenticates against the VCF Salt RaaS API.
-// Step 1: GET /account/login to obtain the Tornado _xsrf cookie.
-// Step 2: POST /account/login with JSON credentials to obtain a JWT.
-// All subsequent /rpc calls use the JWT as a Bearer token.
 func (c *RaaSClient) Login(ctx context.Context) error {
 	c.log.V(1).Info("Fetching _xsrf cookie", "url", c.baseURL+"/account/login")
 
-	c.fetchCookies(ctx, "/account/login")
+	status, err := c.fetchCookies(ctx, "/account/login")
+	if err != nil {
+		return fmt.Errorf("login failed: %w", err)
+	}
 
 	xsrf := c.xsrfToken()
 	if xsrf == "" {
-		return fmt.Errorf("login failed: no _xsrf cookie returned by %s/account/login (check URL and TLS)", c.baseURL)
+		return fmt.Errorf("login failed: no _xsrf cookie returned by %s/account/login "+
+			"(HTTP %d, check that the URL is the RaaS API)", c.baseURL, status)
 	}
 
 	loginPayload := map[string]string{
@@ -155,7 +147,7 @@ func (c *RaaSClient) Login(ctx context.Context) error {
 	req.Header.Set("X-Xsrftoken", xsrf)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
-	c.log.V(1).Info("POST /account/login", "payload", string(encoded))
+	c.log.V(1).Info("POST /account/login", "username", c.username)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -187,13 +179,9 @@ func (c *RaaSClient) Login(ctx context.Context) error {
 	return nil
 }
 
-// ListPendingKeys returns the list of minion IDs with pending (unaccepted) Salt keys.
 func (c *RaaSClient) ListPendingKeys(ctx context.Context) ([]string, error) {
-	respBody, statusCode, err := c.rawPost(ctx, map[string]any{
-		"resource": "minions",
-		"method":   "get_minion_key_state",
-		"kwarg":    map[string]any{"limit": 0, "page": 0, "key_state": "pending"},
-	})
+	respBody, statusCode, err := c.rawPost(ctx, rpc("minions", "get_minion_key_state",
+		map[string]any{"limit": 0, "page": 0, "key_state": "pending"}))
 	if err != nil {
 		return nil, fmt.Errorf("list_pending: %w", err)
 	}
@@ -204,13 +192,9 @@ func (c *RaaSClient) ListPendingKeys(ctx context.Context) ([]string, error) {
 	return extractMinions(respBody)
 }
 
-// ListAcceptedKeys returns the list of minion IDs with accepted (live) Salt keys.
 func (c *RaaSClient) ListAcceptedKeys(ctx context.Context) ([]string, error) {
-	respBody, statusCode, err := c.rawPost(ctx, map[string]any{
-		"resource": "minions",
-		"method":   "get_minion_key_state",
-		"kwarg":    map[string]any{"limit": 0, "page": 0, "key_state": "accepted"},
-	})
+	respBody, statusCode, err := c.rawPost(ctx, rpc("minions", "get_minion_key_state",
+		map[string]any{"limit": 0, "page": 0, "key_state": "accepted"}))
 	if err != nil {
 		return nil, fmt.Errorf("list_accepted: %w", err)
 	}
@@ -221,18 +205,13 @@ func (c *RaaSClient) ListAcceptedKeys(ctx context.Context) ([]string, error) {
 	return extractMinions(respBody)
 }
 
-// AcceptKey accepts a pending Salt minion key by minion ID.
 func (c *RaaSClient) AcceptKey(ctx context.Context, minionID string) error {
-	respBody, statusCode, err := c.rawPost(ctx, map[string]any{
-		"resource": "minions",
-		"method":   "set_minion_key_state",
-		"kwarg": map[string]any{
-			"minions":          []any{[]any{c.masterID, minionID}},
-			"state":            "accept",
-			"include_rejected": true,
-			"include_denied":   true,
-		},
-	})
+	respBody, statusCode, err := c.rawPost(ctx, rpc("minions", "set_minion_key_state", map[string]any{
+		"minions":          []any{[]any{c.masterID, minionID}},
+		"state":            "accept",
+		"include_rejected": true,
+		"include_denied":   true,
+	}))
 	if err != nil {
 		return fmt.Errorf("accept key for %q: %w", minionID, err)
 	}
@@ -240,21 +219,18 @@ func (c *RaaSClient) AcceptKey(ctx context.Context, minionID string) error {
 		return fmt.Errorf("accept key for %q: HTTP %d: %s", minionID, statusCode, string(respBody))
 	}
 	c.log.V(1).Info("accept response", "minionID", minionID, "body", string(respBody))
-	// The RaaS API returns HTTP 200 even when the operation fails; check the body.
 	if err := checkBodyError(respBody); err != nil {
 		return fmt.Errorf("accept key for %q: %w", minionID, err)
 	}
 	return nil
 }
 
-// Call sends a raw /rpc call and returns the unparsed response body.
-// Intended for CLI exploration tools; not used by the operator itself.
+func rpc(resource, method string, kwarg map[string]any) map[string]any {
+	return map[string]any{"resource": resource, "method": method, "kwarg": kwarg}
+}
+
 func (c *RaaSClient) Call(ctx context.Context, resource, method string, kwarg map[string]any) ([]byte, error) {
-	body, status, err := c.rawPost(ctx, map[string]any{
-		"resource": resource,
-		"method":   method,
-		"kwarg":    kwarg,
-	})
+	body, status, err := c.rawPost(ctx, rpc(resource, method, kwarg))
 	if err != nil {
 		return nil, err
 	}
@@ -264,8 +240,6 @@ func (c *RaaSClient) Call(ctx context.Context, resource, method string, kwarg ma
 	return body, nil
 }
 
-// TestPing dispatches test.ping to minionID and waits for the boolean result.
-// The context deadline controls the maximum wait time.
 func (c *RaaSClient) TestPing(ctx context.Context, minionID string) (bool, error) {
 	jid, err := c.dispatch(ctx, minionID, "test.ping", nil)
 	if err != nil {
@@ -274,7 +248,6 @@ func (c *RaaSClient) TestPing(ctx context.Context, minionID string) (bool, error
 	return c.waitBoolResult(ctx, minionID, jid, "test.ping")
 }
 
-// RefreshPillar dispatches saltutil.refresh_pillar to minionID and waits for the result.
 func (c *RaaSClient) RefreshPillar(ctx context.Context, minionID string) (bool, error) {
 	jid, err := c.dispatch(ctx, minionID, "saltutil.refresh_pillar", nil)
 	if err != nil {
@@ -283,20 +256,12 @@ func (c *RaaSClient) RefreshPillar(ctx context.Context, minionID string) (bool, 
 	return c.waitBoolResult(ctx, minionID, jid, "saltutil.refresh_pillar")
 }
 
-// DispatchHighstate dispatches state.highstate asynchronously and returns the JID.
-// Store the JID in an annotation and poll with PollJID on subsequent reconciles.
 func (c *RaaSClient) DispatchHighstate(ctx context.Context, minionID string) (string, error) {
 	return c.dispatch(ctx, minionID, "state.highstate", nil)
 }
 
-// PollJID checks whether a dispatched job has completed for the given minion.
-// Returns (result, true, nil) when done; (nil, false, nil) when still running.
 func (c *RaaSClient) PollJID(ctx context.Context, minionID, jid string) (*JIDResult, bool, error) {
-	body, status, err := c.rawPost(ctx, map[string]any{
-		"resource": "ret",
-		"method":   "get_jid",
-		"kwarg":    map[string]any{"jid": jid},
-	})
+	body, status, err := c.rawPost(ctx, rpc("ret", "get_jid", map[string]any{"jid": jid}))
 	if err != nil {
 		return nil, false, fmt.Errorf("poll_jid(%s): %w", jid, err)
 	}
@@ -319,11 +284,11 @@ func (c *RaaSClient) PollJID(ctx context.Context, minionID, jid string) (*JIDRes
 	}
 	ret, ok := resp["ret"].(map[string]any)
 	if !ok || len(ret) == 0 {
-		return nil, false, nil // not yet complete
+		return nil, false, nil
 	}
 	minionData, ok := ret[minionID]
 	if !ok {
-		return nil, false, nil // this minion's result not yet available
+		return nil, false, nil
 	}
 	minionMap, ok := minionData.(map[string]any)
 	if !ok {
@@ -347,7 +312,6 @@ func (c *RaaSClient) PollJID(ctx context.Context, minionID, jid string) (*JIDRes
 	}, true, nil
 }
 
-// dispatch saves a job template then routes it to a specific minion, returning the JID.
 func (c *RaaSClient) dispatch(ctx context.Context, minionID, fun string, kwarg map[string]any) (string, error) {
 	if kwarg == nil {
 		kwarg = map[string]any{}
@@ -366,19 +330,13 @@ func (c *RaaSClient) dispatch(ctx context.Context, minionID, fun string, kwarg m
 	return jid, nil
 }
 
-// saveJob creates a job template in RaaS and returns its UUID.
-// NOTE: masters must NOT be set for cmd=local (only valid for runner/wheel).
 func (c *RaaSClient) saveJob(ctx context.Context, name, fun string, kwarg map[string]any) (string, error) {
-	body, status, err := c.rawPost(ctx, map[string]any{
-		"resource": "job",
-		"method":   "save_job",
-		"kwarg": map[string]any{
-			"name": name,
-			"cmd":  "local",
-			"fun":  fun,
-			"arg":  map[string]any{"arg": []any{}, "kwarg": kwarg},
-		},
-	})
+	body, status, err := c.rawPost(ctx, rpc("job", "save_job", map[string]any{
+		"name": name,
+		"cmd":  "local",
+		"fun":  fun,
+		"arg":  jobArg{Arg: []any{}, Kwarg: kwarg},
+	}))
 	if err != nil {
 		return "", fmt.Errorf("save_job(%s): %w", fun, err)
 	}
@@ -404,21 +362,16 @@ func (c *RaaSClient) saveJob(ctx context.Context, name, fun string, kwarg map[st
 	return resp.Ret, nil
 }
 
-// routeCmd dispatches a saved job to a specific minion and returns the JID.
 func (c *RaaSClient) routeCmd(ctx context.Context, jobUUID, minionID string) (string, error) {
-	body, status, err := c.rawPost(ctx, map[string]any{
-		"resource": "cmd",
-		"method":   "route_cmd",
-		"kwarg": map[string]any{
-			"job_uuid": jobUUID,
-			"tgt": map[string]any{
-				"salt": map[string]any{
-					"tgt":      "L@" + minionID,
-					"tgt_type": "compound",
-				},
+	body, status, err := c.rawPost(ctx, rpc("cmd", "route_cmd", map[string]any{
+		"job_uuid": jobUUID,
+		"tgt": map[string]any{
+			"salt": map[string]any{
+				"tgt":      "L@" + minionID,
+				"tgt_type": "compound",
 			},
 		},
-	})
+	}))
 	if err != nil {
 		return "", fmt.Errorf("route_cmd(%s): %w", minionID, err)
 	}
@@ -444,7 +397,6 @@ func (c *RaaSClient) routeCmd(ctx context.Context, jobUUID, minionID string) (st
 	return resp.Ret, nil
 }
 
-// waitBoolResult polls PollJID every 5s until the boolean result is available or ctx expires.
 func (c *RaaSClient) waitBoolResult(ctx context.Context, minionID, jid, fun string) (bool, error) {
 	for {
 		result, done, err := c.PollJID(ctx, minionID, jid)
@@ -466,17 +418,41 @@ func (c *RaaSClient) waitBoolResult(ctx context.Context, minionID, jid, fun stri
 	}
 }
 
-// DeleteKey deletes (revokes) a Salt minion key by minion ID.
-// This is intentionally best-effort: errors are returned but callers should treat them as non-fatal.
+func (c *RaaSClient) MasterLastSeen(ctx context.Context) (string, error) {
+	body, statusCode, err := c.rawPost(ctx, rpc("master", "get_master_presence", map[string]any{}))
+	if err != nil {
+		return "", fmt.Errorf("get_master_presence: %w", err)
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return "", fmt.Errorf("get_master_presence: HTTP %d: %s", statusCode, string(body))
+	}
+	if err := checkBodyError(body); err != nil {
+		return "", fmt.Errorf("get_master_presence: %w", err)
+	}
+	var resp struct {
+		Ret struct {
+			Results []struct {
+				MasterID string `json:"master_id"`
+				LastSeen string `json:"last_seen"`
+			} `json:"results"`
+		} `json:"ret"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("get_master_presence: %w", err)
+	}
+	for _, m := range resp.Ret.Results {
+		if m.MasterID == c.masterID {
+			return m.LastSeen, nil
+		}
+	}
+	return "", nil
+}
+
 func (c *RaaSClient) DeleteKey(ctx context.Context, minionID string) error {
-	respBody, statusCode, err := c.rawPost(ctx, map[string]any{
-		"resource": "minions",
-		"method":   "set_minion_key_state",
-		"kwarg": map[string]any{
-			"minions": []any{[]any{c.masterID, minionID}},
-			"state":   "delete",
-		},
-	})
+	respBody, statusCode, err := c.rawPost(ctx, rpc("minions", "set_minion_key_state", map[string]any{
+		"minions": []any{[]any{c.masterID, minionID}},
+		"state":   "delete",
+	}))
 	if err != nil {
 		return fmt.Errorf("delete key for %q: %w", minionID, err)
 	}
@@ -484,14 +460,160 @@ func (c *RaaSClient) DeleteKey(ctx context.Context, minionID string) error {
 		return fmt.Errorf("delete key for %q: HTTP %d: %s", minionID, statusCode, string(respBody))
 	}
 	c.log.V(1).Info("delete response", "minionID", minionID, "body", string(respBody))
-	// The RaaS API returns HTTP 200 even when the operation fails; check the body.
 	if err := checkBodyError(respBody); err != nil {
 		return fmt.Errorf("delete key for %q: %w", minionID, err)
 	}
 	return nil
 }
 
-// xsrfToken returns the current _xsrf cookie value from the jar, or empty string.
+func (c *RaaSClient) KeyStates(ctx context.Context, minionID string) ([]string, error) {
+	body, status, err := c.rawPost(ctx, rpc("minions", "get_minion_key_state",
+		map[string]any{"minion_id": minionID}))
+	if err != nil {
+		return nil, fmt.Errorf("key_state(%s): %w", minionID, err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("key_state(%s): HTTP %d: %s", minionID, status, body)
+	}
+	if err := checkBodyError(body); err != nil {
+		return nil, fmt.Errorf("key_state(%s): %w", minionID, err)
+	}
+	var resp struct {
+		Ret struct {
+			Results []struct {
+				Minion   string   `json:"minion"`
+				KeyState []string `json:"key_state"`
+			} `json:"results"`
+		} `json:"ret"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("key_state(%s): parse response: %w", minionID, err)
+	}
+	var states []string
+	for _, r := range resp.Ret.Results {
+		if r.Minion == minionID {
+			states = append(states, r.KeyState...)
+		}
+	}
+	return states, nil
+}
+
+func (c *RaaSClient) GenAcceptKey(ctx context.Context, minionID string, force bool) (*KeyPair, error) {
+	ret, err := c.wheel(ctx, "key.gen_accept", []any{minionID}, map[string]any{"force": force})
+	if err != nil {
+		return nil, err
+	}
+	var pair KeyPair
+	if err := json.Unmarshal(ret, &pair); err != nil {
+		return nil, fmt.Errorf("key.gen_accept(%s): unexpected return shape", minionID)
+	}
+	if pair.Pub == "" && pair.Priv == "" {
+		return nil, nil
+	}
+	if pair.Pub == "" || pair.Priv == "" {
+		return nil, fmt.Errorf("key.gen_accept(%s): incomplete key pair returned", minionID)
+	}
+	return &pair, nil
+}
+
+func (c *RaaSClient) MasterPublicKey(ctx context.Context) (string, error) {
+	c.mu.RLock()
+	cached := c.masterPub
+	c.mu.RUnlock()
+	if cached != "" {
+		return cached, nil
+	}
+	ret, err := c.wheel(ctx, "key.master_key_str", []any{}, map[string]any{})
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Local map[string]string `json:"local"`
+	}
+	if err := json.Unmarshal(ret, &resp); err != nil {
+		return "", fmt.Errorf("key.master_key_str: parse return: %w", err)
+	}
+	if len(resp.Local) != 1 {
+		return "", fmt.Errorf("key.master_key_str: expected one master key, got %d", len(resp.Local))
+	}
+	var pub string
+	for _, v := range resp.Local {
+		pub = v
+	}
+	if !strings.Contains(pub, "PUBLIC KEY") {
+		return "", fmt.Errorf("key.master_key_str: return is not a public key")
+	}
+	c.mu.Lock()
+	c.masterPub = pub
+	c.mu.Unlock()
+	return pub, nil
+}
+
+func (c *RaaSClient) wheel(ctx context.Context, fun string, args []any, kwarg map[string]any) (json.RawMessage, error) {
+	body, status, err := c.rawPost(ctx, rpc("cmd", "route_cmd", map[string]any{
+		"cmd":     "wheel",
+		"fun":     fun,
+		"masters": []any{c.masterID},
+		"arg":     jobArg{Arg: args, Kwarg: kwarg},
+	}))
+	if err != nil {
+		return nil, fmt.Errorf("%s: route_cmd: %w", fun, err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("%s: route_cmd: HTTP %d: %s", fun, status, body)
+	}
+	var routed struct {
+		Ret   string         `json:"ret"`
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal(body, &routed); err != nil {
+		return nil, fmt.Errorf("%s: route_cmd: parse response: %w", fun, err)
+	}
+	if routed.Error != nil || routed.Ret == "" {
+		return nil, fmt.Errorf("%s: route_cmd: %s", fun, body)
+	}
+	jid := routed.Ret
+	c.log.V(1).Info("dispatched wheel job", "fun", fun, "jid", jid)
+
+	for {
+		body, status, err := c.rawPost(ctx, rpc("ret", "get_jid", map[string]any{"jid": jid}))
+		if err != nil {
+			return nil, fmt.Errorf("%s: get_jid(%s): %w", fun, jid, err)
+		}
+		if status < 200 || status >= 300 {
+			return nil, fmt.Errorf("%s: get_jid(%s): HTTP %d", fun, jid, status)
+		}
+		var resp struct {
+			Ret   map[string]json.RawMessage `json:"ret"`
+			Error map[string]any             `json:"error"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			return nil, fmt.Errorf("%s: get_jid(%s): parse response: %w", fun, jid, err)
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("%s: get_jid(%s): API error: %v", fun, jid, resp.Error["message"])
+		}
+		if raw, ok := resp.Ret[c.masterID]; ok {
+			var result struct {
+				Return  json.RawMessage `json:"return"`
+				Success bool            `json:"success"`
+			}
+			if err := json.Unmarshal(raw, &result); err != nil {
+				return nil, fmt.Errorf("%s: get_jid(%s): parse result: %w", fun, jid, err)
+			}
+			if !result.Success {
+				return nil, fmt.Errorf("%s: failed on master %s (jid %s)", fun, c.masterID, jid)
+			}
+			return result.Return, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%s: timed out waiting for result (jid=%s): %w", fun, jid, ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
 func (c *RaaSClient) xsrfToken() string {
 	if c.httpClient.Jar == nil {
 		return ""
@@ -508,39 +630,33 @@ func (c *RaaSClient) xsrfToken() string {
 	return ""
 }
 
-// fetchCookies does a GET to the given path to prime the cookie jar.
-// This is required for Tornado-based backends that enforce XSRF protection:
-// the server sets a _xsrf cookie on GET which must be echoed back as
-// X-Xsrftoken on every subsequent POST.
-func (c *RaaSClient) fetchCookies(ctx context.Context, path string) {
+func (c *RaaSClient) fetchCookies(ctx context.Context, path string) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return
+		return 0, fmt.Errorf("build GET %s: %w", path, err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return
+		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
 }
 
-// rawPost sends a JSON POST to /rpc, retrying once with a fresh login on HTTP 401 (JWT expiry).
 func (c *RaaSClient) rawPost(ctx context.Context, fields map[string]any) ([]byte, int, error) {
 	body, status, err := c.doPost(ctx, fields)
 	if err != nil || status != http.StatusUnauthorized {
 		return body, status, err
 	}
-	// JWT likely expired — re-login and retry once.
 	if loginErr := c.Login(ctx); loginErr != nil {
 		return nil, status, fmt.Errorf("JWT expired; re-login failed: %w", loginErr)
 	}
 	return c.doPost(ctx, fields)
 }
 
-// doPost sends a single authenticated JSON POST to /rpc without retry logic.
 func (c *RaaSClient) doPost(ctx context.Context, fields map[string]any) ([]byte, int, error) {
 	encoded, err := json.Marshal(fields)
 	if err != nil {
@@ -578,13 +694,10 @@ func (c *RaaSClient) doPost(ctx context.Context, fields map[string]any) ([]byte,
 	return respBody, resp.StatusCode, nil
 }
 
-// checkBodyError inspects a RaaS /rpc response body for {"error": {...}} payloads.
-// The RaaS API returns HTTP 200 for some failure conditions, so HTTP status alone is
-// insufficient for set_minion_key_state (accept/delete) calls.
 func checkBodyError(body []byte) error {
 	var resp map[string]any
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil // non-JSON body; HTTP status check already handled it
+		return nil
 	}
 	errObj, ok := resp["error"]
 	if !ok || errObj == nil {
@@ -598,15 +711,12 @@ func checkBodyError(body []byte) error {
 	return fmt.Errorf("API error: %v", errObj)
 }
 
-// extractMinions parses a minions.get_minion_key_state response and returns the minion IDs.
-// Response structure: {"ret": {"count": N, "results": [{"minion": "id", ...}]}}
 func extractMinions(body []byte) ([]string, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("response is not valid JSON: %w", err)
 	}
 
-	// Surface API-level errors
 	if errObj, ok := raw["error"]; ok && errObj != nil {
 		if m, ok := errObj.(map[string]any); ok {
 			if msg, ok := m["message"].(string); ok && msg != "" {

@@ -1,0 +1,7 @@
+FROM docker.io/rockylinux/rockylinux:9
+COPY salt.repo /etc/yum.repos.d/salt.repo
+COPY auditd-stub.service /etc/systemd/system/auditd.service
+RUN dnf -y install --setopt=install_weak_deps=False salt-minion-3008.3 systemd firewalld procps-ng iproute \
+ && dnf clean all \
+ && systemctl enable salt-minion firewalld auditd
+CMD ["/sbin/init"]

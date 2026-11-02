@@ -2,22 +2,6 @@
 SPDX-License-Identifier: MIT-0
 */
 
-// cmd/scavenger is a one-shot job intended to run as a Kubernetes CronJob. It reconciles
-// stale accepted Salt minion keys - keys still "accepted" in VCF Salt (RaaS) but whose
-// VirtualMachine no longer carries the matching salt.vcf.io/minion-id annotation in K8s,
-// either because the operator missed a VM deletion event, or because a VM's CR was
-// recreated and lost the annotation while its key was already accepted. The second case is
-// a false positive, not a confirmed orphan, which is why deletion defaults off.
-//
-// The default is report-only: deletion requires an explicit --dry-run=false. A key with no
-// correlated VM is logged at error level in both modes, so log-based alerting can catch it
-// before anything is removed.
-//
-// Usage:
-//
-//	scavenger [--dry-run=false] [--kubeconfig <path>]
-//
-// --kubeconfig is registered by an imported controller-runtime package, not here.
 package main
 
 import (
@@ -25,14 +9,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -40,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	saltv1alpha1 "github.com/stanimir-kozarev/vcf-salt-operator/api/v1alpha1"
+	"github.com/stanimir-kozarev/vcf-salt-operator/internal/raasconn"
 	"github.com/stanimir-kozarev/vcf-salt-operator/pkg/salt"
 )
 
@@ -51,12 +36,8 @@ var vmGVK = schema.GroupVersionKind{
 
 const annotationMinionID = "salt.vcf.io/minion-id"
 
-// defaultDryRun is report-only, since the only correlation signal this job trusts is an
-// annotation a recreated VM CR can legitimately lack while still being live.
 const defaultDryRun = true
 
-// saltClientFactory builds the RaaS client, a parameter rather than a direct
-// salt.NewRaaSClient call so tests can substitute a fake client.
 type saltClientFactory func(
 	raasURL, username, password, masterID string,
 	skipTLSVerify bool,
@@ -65,15 +46,31 @@ type saltClientFactory func(
 
 func main() {
 	var dryRun bool
+	var defaultConnection raasconn.Default
+	var excludeMinions string
 
 	flag.BoolVar(&dryRun, "dry-run", defaultDryRun,
 		"Report stale keys without deleting them. Pass --dry-run=false to actually delete")
-	// --kubeconfig itself is registered by sigs.k8s.io/controller-runtime/pkg/client/config's
-	// own init(), not here. Registering it a second time panics with "flag redefined".
+	flag.StringVar(&defaultConnection.SecretName, raasconn.DefaultConnectionFlag, "",
+		"Secret in the scavenger's namespace holding the default RaaS connection, as for the operator")
+	flag.StringVar(&defaultConnection.Namespace, "default-connection-namespace", os.Getenv("POD_NAMESPACE"),
+		"Namespace of the default connection Secret. Defaults to the POD_NAMESPACE environment variable.")
+	flag.StringVar(&excludeMinions, "exclude-minions", "",
+		"Comma-separated glob patterns of minion IDs never scavenged, such as the master's own minion and "+
+			"any minion that is not a VM, for example saltmaster,infra-*")
 	flag.Parse()
 
-	logf.SetLogger(zap.New(zap.UseDevMode(true)))
+	logf.SetLogger(zap.New())
 	log := logf.Log.WithName("scavenger")
+
+	exclude := splitList(excludeMinions)
+	for _, pattern := range exclude {
+		if _, err := path.Match(pattern, ""); err != nil {
+			log.Error(err, "Invalid --exclude-minions pattern", "pattern", pattern)
+			os.Exit(1)
+		}
+	}
+	log.Info("Excluded minions", "patterns", exclude)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -91,16 +88,13 @@ func main() {
 	newSaltClient := func(raasURL, username, password, masterID string, skipTLS bool, log logr.Logger) salt.Client {
 		return salt.NewRaaSClient(raasURL, username, password, masterID, skipTLS, log)
 	}
-	if err := scavenge(ctx, k8sClient, dryRun, newSaltClient); err != nil {
+	if err := scavenge(ctx, k8sClient, dryRun, exclude, defaultConnection, newSaltClient); err != nil {
 		log.Error(err, "Scavenge run failed")
 		os.Exit(1)
 	}
 	log.Info("Scavenge complete")
 }
 
-// buildClient creates a controller-runtime client. ctrlconfig.GetConfig() already
-// honors --kubeconfig, the KUBECONFIG environment variable, in-cluster config, and
-// $HOME/.kube/config, in that order, so no separate flag handling is needed here.
 func buildClient() (client.Client, error) {
 	restCfg, err := ctrlconfig.GetConfig()
 	if err != nil {
@@ -118,16 +112,19 @@ func buildClient() (client.Client, error) {
 	return client.New(restCfg, client.Options{Scheme: s})
 }
 
-// raasGroup holds all the ready SaltKeyConfigs that share a single RaaS endpoint.
 type raasGroup struct {
-	representative *saltv1alpha1.SaltKeyConfig
-	namespaces     []string
+	conn       *raasconn.Connection
+	namespaces []string
 }
 
-// scavenge iterates over all ready SaltKeyConfigs, groups them by RaaS URL so
-// that live-VM lookups cover every managed namespace on that RaaS, and then
-// deletes accepted keys that have no corresponding VM in any of those namespaces.
-func scavenge(ctx context.Context, k8sClient client.Client, dryRun bool, newSaltClient saltClientFactory) error {
+func scavenge(
+	ctx context.Context,
+	k8sClient client.Client,
+	dryRun bool,
+	exclude []string,
+	defaultConnection raasconn.Default,
+	newSaltClient saltClientFactory,
+) error {
 	log := logf.FromContext(ctx).WithName("scavenge")
 
 	cfgList := &saltv1alpha1.SaltKeyConfigList{}
@@ -135,8 +132,6 @@ func scavenge(ctx context.Context, k8sClient client.Client, dryRun bool, newSalt
 		return fmt.Errorf("list SaltKeyConfigs: %w", err)
 	}
 
-	// Group ready configs by RaaS URL so we query each RaaS server only once
-	// and avoid incorrectly deleting keys that belong to sibling namespaces.
 	groups := make(map[string]*raasGroup)
 	for i := range cfgList.Items {
 		cfg := &cfgList.Items[i]
@@ -144,50 +139,42 @@ func scavenge(ctx context.Context, k8sClient client.Client, dryRun bool, newSalt
 			log.Info("Skipping unready SaltKeyConfig", "namespace", cfg.Namespace, "name", cfg.Name)
 			continue
 		}
-		g, ok := groups[cfg.Spec.RaasURL]
+		conn, err := raasconn.Resolve(ctx, k8sClient, cfg, defaultConnection)
+		if err != nil {
+			log.Error(err, "Skipping SaltKeyConfig whose RaaS connection does not resolve",
+				"namespace", cfg.Namespace, "name", cfg.Name)
+			continue
+		}
+		g, ok := groups[conn.URL]
 		if !ok {
-			g = &raasGroup{representative: cfg}
-			groups[cfg.Spec.RaasURL] = g
+			g = &raasGroup{conn: conn}
+			groups[conn.URL] = g
 		}
 		g.namespaces = append(g.namespaces, cfg.Namespace)
 	}
 
 	for url, g := range groups {
-		if err := scavengeRaasGroup(ctx, k8sClient, g, dryRun, newSaltClient); err != nil {
+		if err := scavengeRaasGroup(ctx, k8sClient, g, dryRun, exclude, newSaltClient); err != nil {
 			log.Error(err, "Failed to scavenge RaaS group", "raasURL", url)
 		}
 	}
 	return nil
 }
 
-// scavengeRaasGroup handles all namespaces that share a single RaaS endpoint.
-// It builds a union of live minion IDs from every managed namespace so that keys
-// for VMs in sibling namespaces are never incorrectly deleted.
 func scavengeRaasGroup(
 	ctx context.Context,
 	k8sClient client.Client,
 	g *raasGroup,
 	dryRun bool,
+	exclude []string,
 	newSaltClient saltClientFactory,
 ) error {
-	cfg := g.representative
-	log := logf.FromContext(ctx).WithValues("raasURL", cfg.Spec.RaasURL, "namespaces", g.namespaces)
-
-	// Read credentials from the representative config
-	secret := &corev1.Secret{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{
-		Name:      cfg.Spec.CredentialsSecret,
-		Namespace: cfg.Namespace,
-	}, secret); err != nil {
-		return fmt.Errorf("get credentials secret: %w", err)
-	}
-
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
+	conn := g.conn
+	log := logf.FromContext(ctx).WithValues("raasURL", conn.URL, "namespaces", g.namespaces)
 
 	saltClient := newSaltClient(
-		cfg.Spec.RaasURL, username, password,
-		cfg.Spec.MasterID, cfg.Spec.SkipTLSVerify, log.WithName("raas"),
+		conn.URL, conn.Username, conn.Password,
+		conn.MasterID, conn.SkipTLSVerify, log.WithName("raas"),
 	)
 
 	loginCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -205,8 +192,6 @@ func scavengeRaasGroup(
 		return nil
 	}
 
-	// Collect live minion IDs from ALL managed namespaces for this RaaS.
-	// Using the union prevents deleting keys that belong to sibling namespaces.
 	liveMinions := make(map[string]bool)
 	for _, ns := range g.namespaces {
 		nsMinions, err := liveVMMinionIDs(ctx, k8sClient, ns)
@@ -219,10 +204,13 @@ func scavengeRaasGroup(
 		}
 	}
 
-	// Delete accepted keys with no corresponding VM in any managed namespace
-	deleted, stale := 0, 0
+	deleted, stale, excluded := 0, 0, 0
 	for _, key := range acceptedKeys {
 		if liveMinions[key] {
+			continue
+		}
+		if matchesAny(exclude, key) {
+			excluded++
 			continue
 		}
 		stale++
@@ -242,14 +230,32 @@ func scavengeRaasGroup(
 	log.Info("RaaS group scavenge complete",
 		"acceptedKeys", len(acceptedKeys),
 		"liveVMs", len(liveMinions),
+		"excluded", excluded,
 		"staleFound", stale,
 		"deleted", deleted,
 	)
 	return nil
 }
 
-// liveVMMinionIDs returns the set of salt.vcf.io/minion-id annotation values
-// for all VirtualMachines in the given namespace that have that annotation set.
+func matchesAny(patterns []string, minionID string) bool {
+	for _, p := range patterns {
+		if ok, _ := path.Match(p, minionID); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func splitList(v string) []string {
+	var out []string
+	for item := range strings.SplitSeq(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func liveVMMinionIDs(ctx context.Context, k8sClient client.Client, namespace string) (map[string]bool, error) {
 	vmList := &unstructured.UnstructuredList{}
 	vmList.SetGroupVersionKind(schema.GroupVersionKind{

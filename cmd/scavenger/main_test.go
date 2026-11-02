@@ -16,15 +16,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	saltv1alpha1 "github.com/stanimir-kozarev/vcf-salt-operator/api/v1alpha1"
+	"github.com/stanimir-kozarev/vcf-salt-operator/internal/raasconn"
 	"github.com/stanimir-kozarev/vcf-salt-operator/pkg/salt"
 )
 
-// fakeSaltClient is a test double for salt.Client.
-// It records which keys DeleteKey was called with, so a test can assert the
-// scavenger never invokes it when it should not.
 type fakeSaltClient struct {
 	accepted  []string
 	deleted   []string
@@ -58,15 +57,33 @@ func (f *fakeSaltClient) PollJID(_ context.Context, minionID, jid string) (*salt
 	return &salt.JIDResult{MinionID: minionID, JID: jid, Success: true}, true, nil
 }
 
+func (f *fakeSaltClient) MasterLastSeen(_ context.Context) (string, error) {
+	return "", nil
+}
+
+func (f *fakeSaltClient) KeyStates(_ context.Context, _ string) ([]string, error) { return nil, nil }
+
+func (f *fakeSaltClient) GenAcceptKey(_ context.Context, _ string, _ bool) (*salt.KeyPair, error) {
+	return nil, nil
+}
+
+func (f *fakeSaltClient) MasterPublicKey(_ context.Context) (string, error) { return "", nil }
+
+func mustResolve(t *testing.T, k8sClient client.Reader, cfg *saltv1alpha1.SaltKeyConfig) *raasconn.Connection {
+	t.Helper()
+	conn, err := raasconn.Resolve(context.Background(), k8sClient, cfg, raasconn.Default{})
+	if err != nil {
+		t.Fatalf("resolve connection: %v", err)
+	}
+	return conn
+}
+
 func newFakeFactory(fake *fakeSaltClient) saltClientFactory {
 	return func(_, _, _, _ string, _ bool, _ logr.Logger) salt.Client {
 		return fake
 	}
 }
 
-// makeVM returns an unstructured VirtualMachine carrying the minion-id annotation
-// the scavenger reads. An empty id omits the annotation entirely, standing in for
-// a VM whose CR was recreated and lost it.
 func makeVM(name, namespace, id string) *unstructured.Unstructured {
 	vm := &unstructured.Unstructured{}
 	vm.SetGroupVersionKind(schema.GroupVersionKind{
@@ -88,8 +105,6 @@ func TestDryRunDefaultsToTrue(t *testing.T) {
 			"produce false positives on a recreated VM CR")
 	}
 
-	// Also proves the invariant the default depends on: scavengeRaasGroup must
-	// never call DeleteKey when dryRun is true, whatever the caller passes.
 	fake := &fakeSaltClient{accepted: []string{"orphan-01"}}
 
 	s := runtime.NewScheme()
@@ -113,9 +128,9 @@ func TestDryRunDefaultsToTrue(t *testing.T) {
 			MasterID:          "master-01",
 		},
 	}
-	g := &raasGroup{representative: cfg, namespaces: []string{"team-alpha"}}
+	g := &raasGroup{conn: mustResolve(t, k8sClient, cfg), namespaces: []string{"team-alpha"}}
 
-	if err := scavengeRaasGroup(context.Background(), k8sClient, g, true, newFakeFactory(fake)); err != nil {
+	if err := scavengeRaasGroup(context.Background(), k8sClient, g, true, nil, newFakeFactory(fake)); err != nil {
 		t.Fatalf("scavengeRaasGroup: %v", err)
 	}
 	if len(fake.deleted) != 0 {
@@ -148,9 +163,45 @@ func TestScavengeRaasGroup_OnlyDeletesUncorrelatedKeys(t *testing.T) {
 			MasterID:          "master-01",
 		},
 	}
-	g := &raasGroup{representative: cfg, namespaces: []string{"team-alpha"}}
+	g := &raasGroup{conn: mustResolve(t, k8sClient, cfg), namespaces: []string{"team-alpha"}}
 
-	if err := scavengeRaasGroup(context.Background(), k8sClient, g, false, newFakeFactory(fake)); err != nil {
+	if err := scavengeRaasGroup(context.Background(), k8sClient, g, false, nil, newFakeFactory(fake)); err != nil {
+		t.Fatalf("scavengeRaasGroup: %v", err)
+	}
+	if len(fake.deleted) != 1 || fake.deleted[0] != "orphan-01" {
+		t.Fatalf("expected only orphan-01 deleted, got %v", fake.deleted)
+	}
+}
+
+func TestScavengeRaasGroup_ExcludedMinionsAreNeverDeleted(t *testing.T) {
+	fake := &fakeSaltClient{accepted: []string{"live-01", "saltmaster", "infra-dns", "orphan-01"}}
+
+	s := runtime.NewScheme()
+	if err := scheme.AddToScheme(s); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := saltv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add saltv1alpha1 scheme: %v", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "team-alpha"},
+		Data:       map[string][]byte{"username": []byte("u"), "password": []byte("p")},
+	}
+	vm := makeVM("web-01", "team-alpha", "live-01")
+	k8sClient := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(secret).WithRuntimeObjects(vm).Build()
+
+	cfg := &saltv1alpha1.SaltKeyConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "cfg", Namespace: "team-alpha"},
+		Spec: saltv1alpha1.SaltKeyConfigSpec{
+			RaasURL:           "https://raas.example",
+			CredentialsSecret: "creds",
+			MasterID:          "master-01",
+		},
+	}
+	g := &raasGroup{conn: mustResolve(t, k8sClient, cfg), namespaces: []string{"team-alpha"}}
+
+	exclude := []string{"saltmaster", "infra-*"}
+	if err := scavengeRaasGroup(context.Background(), k8sClient, g, false, exclude, newFakeFactory(fake)); err != nil {
 		t.Fatalf("scavengeRaasGroup: %v", err)
 	}
 	if len(fake.deleted) != 1 || fake.deleted[0] != "orphan-01" {
@@ -159,9 +210,6 @@ func TestScavengeRaasGroup_OnlyDeletesUncorrelatedKeys(t *testing.T) {
 }
 
 func TestScavengeRaasGroup_RecreatedCRWithoutAnnotationIsTreatedAsOrphan(t *testing.T) {
-	// A VM whose CR was recreated after its key was already accepted has no
-	// minion-id annotation, even though it is genuinely live. This is the exact
-	// false-positive case the report-only default exists to catch before deletion.
 	fake := &fakeSaltClient{accepted: []string{"recreated-01"}}
 
 	s := runtime.NewScheme()
@@ -186,9 +234,9 @@ func TestScavengeRaasGroup_RecreatedCRWithoutAnnotationIsTreatedAsOrphan(t *test
 			MasterID:          "master-01",
 		},
 	}
-	g := &raasGroup{representative: cfg, namespaces: []string{"team-alpha"}}
+	g := &raasGroup{conn: mustResolve(t, k8sClient, cfg), namespaces: []string{"team-alpha"}}
 
-	if err := scavengeRaasGroup(context.Background(), k8sClient, g, true, newFakeFactory(fake)); err != nil {
+	if err := scavengeRaasGroup(context.Background(), k8sClient, g, true, nil, newFakeFactory(fake)); err != nil {
 		t.Fatalf("scavengeRaasGroup: %v", err)
 	}
 	if len(fake.deleted) != 0 {
@@ -220,12 +268,61 @@ func TestScavengeRaasGroup_DeleteFailureIsNotCountedAsDeleted(t *testing.T) {
 			MasterID:          "master-01",
 		},
 	}
-	g := &raasGroup{representative: cfg, namespaces: []string{"team-alpha"}}
+	g := &raasGroup{conn: mustResolve(t, k8sClient, cfg), namespaces: []string{"team-alpha"}}
 
-	if err := scavengeRaasGroup(context.Background(), k8sClient, g, false, newFakeFactory(fake)); err != nil {
+	if err := scavengeRaasGroup(context.Background(), k8sClient, g, false, nil, newFakeFactory(fake)); err != nil {
 		t.Fatalf("scavengeRaasGroup: %v", err)
 	}
 	if len(fake.deleted) != 1 {
 		t.Fatalf("DeleteKey should still be attempted once, got %v", fake.deleted)
+	}
+}
+
+func TestScavenge_DefaultConnectionEndpointOnly(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := scheme.AddToScheme(s); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+	if err := saltv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add saltv1alpha1 scheme: %v", err)
+	}
+	ready := []metav1.Condition{{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Ready"}}
+	defaultSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "raas-connection", Namespace: "svc-salt"},
+		Data: map[string][]byte{
+			"url": []byte("https://raas.platform"), "masterID": []byte("master-01"),
+			"username": []byte("u"), "password": []byte("p"),
+		},
+	}
+	usesDefault := &saltv1alpha1.SaltKeyConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "team-alpha"},
+		Status:     saltv1alpha1.SaltKeyConfigStatus{Conditions: ready},
+	}
+	redirects := &saltv1alpha1.SaltKeyConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "team-rogue"},
+		Spec:       saltv1alpha1.SaltKeyConfigSpec{RaasURL: "https://attacker.example"},
+		Status:     saltv1alpha1.SaltKeyConfigStatus{Conditions: ready},
+	}
+	k8sClient := fakeclient.NewClientBuilder().WithScheme(s).
+		WithObjects(defaultSecret, usesDefault, redirects).
+		WithStatusSubresource(&saltv1alpha1.SaltKeyConfig{}).Build()
+	for _, c := range []*saltv1alpha1.SaltKeyConfig{usesDefault, redirects} {
+		c.Status.Conditions = ready
+		if err := k8sClient.Status().Update(context.Background(), c); err != nil {
+			t.Fatalf("set status: %v", err)
+		}
+	}
+
+	var urls []string
+	factory := func(url, user, _, _ string, _ bool, _ logr.Logger) salt.Client {
+		urls = append(urls, url+" as "+user)
+		return &fakeSaltClient{}
+	}
+	def := raasconn.Default{Namespace: "svc-salt", SecretName: "raas-connection"}
+	if err := scavenge(context.Background(), k8sClient, true, nil, def, factory); err != nil {
+		t.Fatalf("scavenge: %v", err)
+	}
+	if len(urls) != 1 || urls[0] != "https://raas.platform as u" {
+		t.Fatalf("expected one client for the default endpoint only, got %v", urls)
 	}
 }

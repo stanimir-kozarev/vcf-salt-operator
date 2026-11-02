@@ -1,0 +1,74 @@
+#@ load("@ytt:data", "data")
+#@ load("@ytt:yaml", "yaml")
+
+#@ def cfg(region, key, default):
+#@   c = getattr(region, "configuration", None)
+#@   if c == None:
+#@     return default
+#@   end
+#@   return getattr(c, key, default)
+#@ end
+
+#@ def values_for(region):
+raas:
+  connectionSecret: raas-connection
+  connection:
+    url: #@ cfg(region, "raasURL", "")
+    masterID: #@ cfg(region, "raasMasterID", "")
+    username: #@ cfg(region, "raasUsername", "")
+    password: #@ cfg(region, "raasPassword", "")
+    insecureSkipVerify: #@ cfg(region, "raasInsecureSkipVerify", False)
+enrolment:
+  namespaces: #@ list(cfg(region, "enrolNamespaces", []))
+  all: #@ cfg(region, "enrolAllNamespaces", False)
+  namespaceSelector: #@ cfg(region, "enrolNamespaceSelector", "")
+  keyAcceptance: #@ cfg(region, "enrolKeyAcceptance", "discovery")
+scavenger:
+  excludeMinions: #@ cfg(region, "scavengerExcludeMinions", "")
+rbac:
+  tenantCredentialSecrets: false
+  preseedKeys: #@ cfg(region, "preseedKeys", False)
+#@ end
+
+#@ for region in data.values.regions:
+#@   for sup in region.supervisors:
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  labels:
+    services.vcfa.broadcom.com/name: #@ "salt-operator-values-{}-{}".format(region.name, sup)
+    services.vcfa.broadcom.com/context: install
+    services.vcfa.broadcom.com/link-region: #@ region.name
+type: Opaque
+stringData:
+  values: #@ yaml.encode(values_for(region))
+
+---
+apiVersion: services.vcfa.broadcom.com/v2
+kind: SupervisorService
+metadata:
+  annotations:
+    services.vcfa.broadcom.com/description: #@ "Installs the VCF Salt Operator on supervisor {}.".format(sup)
+  labels:
+    services.vcfa.broadcom.com/name: #@ "salt-operator-install-{}-{}".format(region.name, sup)
+spec:
+  region: #@ region.name
+  supervisor: #@ sup
+  package: #@ data.values.dependencies.package
+  packageMetadata: #@ data.values.dependencies.packageMetadata
+  values:
+    selector:
+      kind: Secret
+      labels:
+        services.vcfa.broadcom.com/name: #@ "salt-operator-values-{}-{}".format(region.name, sup)
+      path: data.values
+  readyConditions:
+  - name: operatorReady
+    supervisorSelector:
+      kind: ConfigMap
+      name: vcf-salt-operator-ready
+      path: data.ready
+#@   end
+#@ end

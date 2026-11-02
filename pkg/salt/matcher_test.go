@@ -107,7 +107,7 @@ func TestFindMinionID(t *testing.T) {
 			name:        "prefix does not match partial word (no dot)",
 			vmName:      "vm-web",
 			vmIP:        "",
-			pendingKeys: []string{"vm-web-01", "vm-web-02"}, // no dot after vmName
+			pendingKeys: []string{"vm-web-01", "vm-web-02"},
 			wantMinion:  "",
 			wantMethod:  salt.MatchNone,
 		},
@@ -159,15 +159,14 @@ func TestFindMinionID(t *testing.T) {
 }
 
 func TestShiftFirstOctet_EdgeCases(t *testing.T) {
-	// Test the shiftFirstOctet logic indirectly via FindMinionID
 	tests := []struct {
 		ip        string
-		pendingIP string // what the minion registered as
+		pendingIP string
 		wantMatch bool
 	}{
 		{"10.192.168.100", "192.168.100.10", true},
 		{"10.0.0.1", "0.0.1.10", true},
-		{"256.0.0.1", "0.0.1.256", false}, // invalid IP — but matcher won't crash
+		{"256.0.0.1", "0.0.1.256", false},
 		{"not-an-ip", "not-an-ip", false},
 		{"", "", false},
 	}

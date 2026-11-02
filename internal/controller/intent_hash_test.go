@@ -6,10 +6,6 @@ package controller
 
 import "testing"
 
-// TestComputeIntentHash_Deterministic asserts the digest is stable across repeated calls
-// with a freshly-built map each time. Go randomizes map iteration order per process, not
-// just per map instance, so this is the case that would actually catch a regression if the
-// sort-before-hash step in computeIntentHash were ever accidentally dropped.
 func TestComputeIntentHash_Deterministic(t *testing.T) {
 	build := func() map[string]string {
 		return map[string]string{
@@ -29,10 +25,6 @@ func TestComputeIntentHash_Deterministic(t *testing.T) {
 	}
 }
 
-// TestComputeIntentHash_IgnoresOperatorStatusKeys asserts that changing only an
-// operator-written status annotation never changes the digest. The whole point of the
-// deny-list is that the operator's own writes (highstate-time, highstate-jid, ...) must not
-// be mistaken for tenant intent and cause the operator to perpetually re-trigger itself.
 func TestComputeIntentHash_IgnoresOperatorStatusKeys(t *testing.T) {
 	base := map[string]string{
 		AnnotationRoles: "web_server",
@@ -57,10 +49,6 @@ func TestComputeIntentHash_IgnoresOperatorStatusKeys(t *testing.T) {
 	}
 }
 
-// TestComputeIntentHash_IgnoresNonSaltAnnotations asserts a non-"salt.vcf.io/" annotation
-// (e.g. one written by some other controller sharing the same VM object, or by kubectl
-// itself) is never included. Only this operator's own tenant-facing contract should be
-// able to trigger a Day-2 re-dispatch.
 func TestComputeIntentHash_IgnoresNonSaltAnnotations(t *testing.T) {
 	base := map[string]string{AnnotationRoles: "web_server"}
 	withForeign := map[string]string{
@@ -74,10 +62,6 @@ func TestComputeIntentHash_IgnoresNonSaltAnnotations(t *testing.T) {
 	}
 }
 
-// TestComputeIntentHash_DetectsIntentChanges asserts a change to any tenant-declared
-// salt.vcf.io/* key, not just AnnotationRoles, produces a different digest. The drift
-// detector must not be blind to tag/*, cis-profile, cis-exceptions/*, environment, or
-// vault-path changes.
 func TestComputeIntentHash_DetectsIntentChanges(t *testing.T) {
 	cases := []struct {
 		name   string

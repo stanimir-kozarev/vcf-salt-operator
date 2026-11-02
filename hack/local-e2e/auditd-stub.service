@@ -1,0 +1,8 @@
+[Unit]
+Description=auditd stand-in for the local e2e minion container
+
+[Service]
+ExecStart=/bin/sleep infinity
+
+[Install]
+WantedBy=multi-user.target

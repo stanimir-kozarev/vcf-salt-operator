@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 
 	"github.com/stanimir-kozarev/vcf-salt-operator/pkg/salt"
 )
@@ -18,11 +19,6 @@ const (
 	testJWT  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test.signature"
 )
 
-// mockRaaSServer creates a test HTTP server that simulates the VCF Salt RaaS API.
-// Flow: GET /account/login → _xsrf cookie;
-//
-//	POST /account/login (JSON) → JWT;
-//	POST /rpc → Bearer JWT + X-Xsrftoken.
 func mockRaaSServer(t *testing.T, pendingKeys []string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -111,8 +107,25 @@ func TestLogin_Success(t *testing.T) {
 	}
 }
 
+func TestLogin_DebugLogOmitsPassword(t *testing.T) {
+	server := mockRaaSServer(t, nil)
+	defer server.Close()
+
+	var logged strings.Builder
+	log := funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{Verbosity: 9})
+	client := salt.NewRaaSClient(server.URL, "admin", "password", "test-master", true, log)
+	if err := client.Login(context.Background()); err != nil {
+		t.Fatalf("expected Login to succeed, got: %v", err)
+	}
+	if !strings.Contains(logged.String(), "/account/login") {
+		t.Fatalf("expected debug output for the login, got: %s", logged.String())
+	}
+	if strings.Contains(logged.String(), "password") {
+		t.Fatalf("debug log carries the password: %s", logged.String())
+	}
+}
+
 func TestLogin_BadCredentials(t *testing.T) {
-	// Server sets _xsrf cookie but rejects wrong credentials with 401
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "_xsrf", Value: testXSRF, Path: "/"})
 		if r.Method == http.MethodGet {
@@ -221,8 +234,6 @@ func TestAcceptKey_Unauthorized(t *testing.T) {
 	server := mockRaaSServer(t, []string{"vm-01"})
 	defer server.Close()
 
-	// Use wrong credentials: /rpc returns 401, rawPost retries by calling Login,
-	// Login also returns 401 (bad creds) → AcceptKey must return an error.
 	client := salt.NewRaaSClient(server.URL, "wrong-user", "wrong-pass", "test-master", true, logr.Discard())
 
 	if err := client.AcceptKey(context.Background(), "vm-01"); err == nil {
@@ -231,20 +242,39 @@ func TestAcceptKey_Unauthorized(t *testing.T) {
 }
 
 func TestLogin_NoCookieAfterLogin(t *testing.T) {
-	// Server that never sets the _xsrf cookie
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 
 	client := salt.NewRaaSClient(server.URL, "admin", "password", "test-master", true, logr.Discard())
-	if err := client.Login(context.Background()); err == nil {
+	err := client.Login(context.Background())
+	if err == nil {
 		t.Fatal("expected Login to fail when server sets no _xsrf cookie, got nil")
+	}
+	if !strings.Contains(err.Error(), "no _xsrf cookie") || !strings.Contains(err.Error(), "HTTP 200") {
+		t.Errorf("error should name the missing cookie and the HTTP status, got: %v", err)
 	}
 }
 
-// mockRaaSServerWithKeyStateError returns a server that responds to set_minion_key_state
-// with HTTP 200 but an error payload in the body — the real RaaS behaviour on failure.
+func TestLogin_UnreachableReportsTransportError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := server.URL
+	server.Close()
+
+	client := salt.NewRaaSClient(url, "admin", "password", "test-master", true, logr.Discard())
+	err := client.Login(context.Background())
+	if err == nil {
+		t.Fatal("expected Login to fail against a closed server, got nil")
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Errorf("error should carry the transport cause, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "no _xsrf cookie") {
+		t.Errorf("an unreachable server must not be reported as a missing cookie, got: %v", err)
+	}
+}
+
 func mockRaaSServerWithKeyStateError(t *testing.T, errorMessage string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -259,7 +289,6 @@ func mockRaaSServerWithKeyStateError(t *testing.T, errorMessage string) *httptes
 	})
 	mux.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// HTTP 200 with error payload — the RaaS API behaviour on set_minion_key_state failure.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ret":   nil,
 			"error": map[string]any{"message": errorMessage},
@@ -305,7 +334,6 @@ func TestDeleteKey_BodyLevelError(t *testing.T) {
 }
 
 func TestRPC_BearerJWTAndXSRFSent(t *testing.T) {
-	// Verify Bearer JWT and X-Xsrftoken are both sent on /rpc calls
 	server := mockRaaSServer(t, []string{})
 	defer server.Close()
 
@@ -313,8 +341,220 @@ func TestRPC_BearerJWTAndXSRFSent(t *testing.T) {
 	if err := client.Login(context.Background()); err != nil {
 		t.Fatalf("login failed: %v", err)
 	}
-	// ListPendingKeys calls /rpc — mock returns 401 if no Bearer, 403 if no X-Xsrftoken
 	if _, err := client.ListPendingKeys(context.Background()); err != nil {
 		t.Errorf("expected /rpc to succeed with Bearer JWT and X-Xsrftoken, got: %v", err)
+	}
+}
+
+const (
+	testPub  = "-----BEGIN PUBLIC KEY-----\nMIIBIjAN\n-----END PUBLIC KEY-----"
+	testPriv = "-----BEGIN RSA PRIVATE KEY-----\nMIIEsecret\n-----END RSA PRIVATE KEY-----"
+)
+
+func mockRPCServer(t *testing.T, handle func(method string, kwarg map[string]any) any) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/account/login", func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "_xsrf", Value: testXSRF, Path: "/"})
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"jwt": testJWT})
+	})
+	mux.HandleFunc("/rpc", func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		method, _ := req["method"].(string)
+		kwarg, _ := req["kwarg"].(map[string]any)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(handle(method, kwarg))
+	})
+	return httptest.NewServer(mux)
+}
+
+func wheelServer(t *testing.T, returns map[string]any, routed *[]map[string]any) *httptest.Server {
+	t.Helper()
+	return mockRPCServer(t, func(method string, kwarg map[string]any) any {
+		switch method {
+		case "route_cmd":
+			*routed = append(*routed, kwarg)
+			return map[string]any{"ret": "jid-" + kwarg["fun"].(string), "error": nil}
+		case "get_jid":
+			fun := strings.TrimPrefix(kwarg["jid"].(string), "jid-")
+			return map[string]any{"ret": map[string]any{
+				"test-master": map[string]any{"return": returns[fun], "success": true},
+			}}
+		}
+		return map[string]any{"error": map[string]any{"message": "unexpected " + method}}
+	})
+}
+
+func loggedIn(t *testing.T, url string, log logr.Logger) *salt.RaaSClient {
+	t.Helper()
+	c := salt.NewRaaSClient(url, "admin", "password", "test-master", true, log)
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("login failed: %v", err)
+	}
+	return c
+}
+
+func TestKeyStates_FiltersToExactMinion(t *testing.T) {
+	var asked any
+	server := mockRPCServer(t, func(method string, kwarg map[string]any) any {
+		asked = kwarg["minion_id"]
+		return map[string]any{"ret": map[string]any{"results": []any{
+			map[string]any{"minion": "vm-a", "key_state": []string{"accepted", "denied"}},
+			map[string]any{"minion": "vm-a2", "key_state": []string{"pending"}},
+		}}}
+	})
+	defer server.Close()
+
+	states, err := loggedIn(t, server.URL, logr.Discard()).KeyStates(context.Background(), "vm-a")
+	if err != nil {
+		t.Fatalf("KeyStates failed: %v", err)
+	}
+	if asked != "vm-a" {
+		t.Errorf("expected the minion_id filter vm-a, got %v", asked)
+	}
+	if strings.Join(states, ",") != "accepted,denied" {
+		t.Errorf("expected [accepted denied], got %v", states)
+	}
+}
+
+func TestGenAcceptKey_SendsWheelJobAndReturnsPair(t *testing.T) {
+	var routed []map[string]any
+	server := wheelServer(t, map[string]any{"key.gen_accept": map[string]any{"pub": testPub, "priv": testPriv}}, &routed)
+	defer server.Close()
+
+	pair, err := loggedIn(t, server.URL, logr.Discard()).GenAcceptKey(context.Background(), "vm-a", true)
+	if err != nil {
+		t.Fatalf("GenAcceptKey failed: %v", err)
+	}
+	if pair == nil || pair.Pub != testPub || pair.Priv != testPriv {
+		t.Fatalf("unexpected pair: %+v", pair)
+	}
+	got, _ := json.Marshal(routed[0])
+	want := `{"arg":{"arg":["vm-a"],"kwarg":{"force":true}},` +
+		`"cmd":"wheel","fun":"key.gen_accept","masters":["test-master"]}`
+	if string(got) != want {
+		t.Errorf("route_cmd kwarg\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestGenAcceptKey_ExistingKeyReturnsNil(t *testing.T) {
+	var routed []map[string]any
+	server := wheelServer(t, map[string]any{"key.gen_accept": map[string]any{}}, &routed)
+	defer server.Close()
+
+	pair, err := loggedIn(t, server.URL, logr.Discard()).GenAcceptKey(context.Background(), "vm-a", false)
+	if err != nil || pair != nil {
+		t.Fatalf("expected no pair and no error for an existing key, got %+v, %v", pair, err)
+	}
+}
+
+func TestGenAcceptKey_WaitsForTheReturn(t *testing.T) {
+	polls := 0
+	server := mockRPCServer(t, func(method string, _ map[string]any) any {
+		if method == "route_cmd" {
+			return map[string]any{"ret": "jid-1"}
+		}
+		polls++
+		if polls == 1 {
+			return map[string]any{"ret": map[string]any{}}
+		}
+		return map[string]any{"ret": map[string]any{
+			"test-master": map[string]any{"return": map[string]any{"pub": testPub, "priv": testPriv}, "success": true},
+		}}
+	})
+	defer server.Close()
+
+	pair, err := loggedIn(t, server.URL, logr.Discard()).GenAcceptKey(context.Background(), "vm-a", false)
+	if err != nil || pair == nil {
+		t.Fatalf("expected a pair after the second poll, got %+v, %v", pair, err)
+	}
+	if polls != 2 {
+		t.Errorf("expected 2 polls, got %d", polls)
+	}
+}
+
+func TestGenAcceptKey_FailedJobIsAnError(t *testing.T) {
+	server := mockRPCServer(t, func(method string, _ map[string]any) any {
+		if method == "route_cmd" {
+			return map[string]any{"ret": "jid-1"}
+		}
+		return map[string]any{"ret": map[string]any{
+			"test-master": map[string]any{"return": "Exception occurred in wheel key.gen_accept", "success": false},
+		}}
+	})
+	defer server.Close()
+
+	if _, err := loggedIn(t, server.URL, logr.Discard()).GenAcceptKey(context.Background(), "vm-a", false); err == nil {
+		t.Fatal("expected an error for a failed wheel job")
+	}
+}
+
+func TestGenAcceptKey_PrivateKeyNeverLoggedOrInErrors(t *testing.T) {
+	var logged strings.Builder
+	log := funcr.New(func(_, args string) { logged.WriteString(args + "\n") }, funcr.Options{Verbosity: 9})
+
+	var routed []map[string]any
+	server := wheelServer(t, map[string]any{"key.gen_accept": map[string]any{"pub": testPub, "priv": testPriv}}, &routed)
+	defer server.Close()
+	if _, err := loggedIn(t, server.URL, log).GenAcceptKey(context.Background(), "vm-a", false); err != nil {
+		t.Fatalf("GenAcceptKey failed: %v", err)
+	}
+	if !strings.Contains(logged.String(), "key.gen_accept") {
+		t.Fatalf("expected debug output for the wheel job, got: %s", logged.String())
+	}
+	if strings.Contains(logged.String(), "MIIEsecret") {
+		t.Fatalf("debug log carries the private key: %s", logged.String())
+	}
+
+	half := wheelServer(t, map[string]any{"key.gen_accept": map[string]any{"priv": testPriv}}, &routed)
+	defer half.Close()
+	_, err := loggedIn(t, half.URL, logr.Discard()).GenAcceptKey(context.Background(), "vm-a", false)
+	if err == nil {
+		t.Fatal("expected an error for a pair without a public key")
+	}
+	if strings.Contains(err.Error(), "MIIEsecret") {
+		t.Fatalf("error carries the private key: %v", err)
+	}
+}
+
+func TestMasterPublicKey_FetchedOnceThenCached(t *testing.T) {
+	var routed []map[string]any
+	server := wheelServer(t, map[string]any{"key.master_key_str": map[string]any{
+		"local": map[string]any{"master.pub": testPub},
+	}}, &routed)
+	defer server.Close()
+
+	c := loggedIn(t, server.URL, logr.Discard())
+	for range 2 {
+		pub, err := c.MasterPublicKey(context.Background())
+		if err != nil || pub != testPub {
+			t.Fatalf("expected the master key, got %q, %v", pub, err)
+		}
+	}
+	if len(routed) != 1 {
+		t.Errorf("expected one wheel job, got %d", len(routed))
+	}
+}
+
+func TestMasterPublicKey_RejectsAmbiguousOrNonKeyReturns(t *testing.T) {
+	for name, local := range map[string]map[string]any{
+		"two keys":  {"a.pub": testPub, "b.pub": testPub},
+		"not a key": {"master.pub": "no key here"},
+	} {
+		var routed []map[string]any
+		server := wheelServer(t, map[string]any{"key.master_key_str": map[string]any{"local": local}}, &routed)
+		if _, err := loggedIn(t, server.URL, logr.Discard()).MasterPublicKey(context.Background()); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+		server.Close()
 	}
 }

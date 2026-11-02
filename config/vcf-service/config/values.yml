@@ -1,0 +1,12 @@
+#@data/values
+#@overlay/match-child-defaults missing_ok=True
+---
+regions: []
+
+system:
+  vcfDepotFqdn: vcf-depot.kube-system.svc
+  vcfDepotCaChain: ""
+
+dependencies:
+  package: null
+  packageMetadata: null
