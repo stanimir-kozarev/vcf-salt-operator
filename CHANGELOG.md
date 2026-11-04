@@ -8,6 +8,20 @@ Entries are named after the feature they introduced, using the same names the
 [README](README.md) uses for its sections, so a capability can be traced from how it
 works to when it shipped.
 
+## v0.5.1 - 2026-11-04
+
+Tested on VCF 9.1.1 as a VCF Service, fresh install. See [Platform support](README.md#platform-support).
+
+### Fixed
+
+- **`acceptTimeout` counts from the VM's creation in vSphere.** It counted from the
+  creation of the VirtualMachine object, so a slow vSphere placement used up the time the
+  guest had to boot and write its key. In preseed the key could then be cleared before
+  cloud-init wrote it, and the minion never connected. The time limit now starts at the
+  VM's `VirtualMachineCreated` condition, for the key clear, the preseed `Failed` marking
+  and the pending key wait. A VM not yet created in vSphere keeps waiting, since no guest
+  can read its key yet.
+
 ## v0.5.0 - 2026-11-01
 
 Tested on VCF 9.1.1 as a VCF Service. See [Platform support](README.md#platform-support).

@@ -167,6 +167,7 @@ func setVMStatus(ctx context.Context, vm *unstructured.Unstructured, phase, ip s
 			"network": map[string]any{
 				"primaryIP4": ip,
 			},
+			"conditions": []any{createdCondition()},
 		},
 	}
 	vmCopy := vm.DeepCopy()
@@ -182,11 +183,20 @@ func setVMStatusV1Alpha4(ctx context.Context, vm *unstructured.Unstructured, pow
 			"network": map[string]any{
 				"primaryIP4": ip,
 			},
+			"conditions": []any{createdCondition()},
 		},
 	}
 	vmCopy := vm.DeepCopy()
 	Expect(unstructured.SetNestedField(vmCopy.Object, statusPatch["status"], "status")).To(Succeed())
 	Expect(k8sClient.Status().Update(ctx, vmCopy)).To(Succeed())
+}
+
+func createdCondition() map[string]any {
+	return map[string]any{
+		"type":               vmConditionCreated,
+		"status":             "True",
+		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+	}
 }
 
 func makeSaltKeyConfig(ctx context.Context, namespace string) {

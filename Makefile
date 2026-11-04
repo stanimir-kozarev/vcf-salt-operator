@@ -160,7 +160,7 @@ build-installer-vcf9: manifests generate kustomize ## Generate minimal install b
 
 ##@ Supervisor Service (VCF9)
 
-VERSION          ?= 0.5.0
+VERSION          ?= 0.5.1
 SERVICE_ID       ?= vcf-salt-operator.salt.vcf.io
 BUNDLE_IMG       ?= ghcr.io/stanimir-kozarev/vcf-salt-operator-bundle:$(VERSION)
 SUPSVC_SRC       := config/supervisor-service

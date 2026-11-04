@@ -253,7 +253,8 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 	log := logf.FromContext(ctx)
 	requeueAfter := parseDurationOrDefault(cfg.Spec.RequeueInterval, 30*time.Second)
 	acceptTimeout := parseDurationOrDefault(cfg.Spec.AcceptTimeout, 10*time.Minute)
-	timedOut := time.Since(vm.GetCreationTimestamp().Time) >= acceptTimeout
+	elapsed, created := sinceVSphereCreate(vm)
+	timedOut := created && elapsed >= acceptTimeout
 
 	switch {
 	case guestSignalled(vm):
@@ -288,7 +289,7 @@ func (r *VirtualMachineReconciler) reconcileCreate(
 				return ctrl.Result{}, err
 			}
 			r.Recorder.Event(vm, corev1.EventTypeWarning, "SaltKeyTimeout",
-				fmt.Sprintf("VM not running with an IP %s after creation, recreate it for a new key", acceptTimeout))
+				fmt.Sprintf("VM not running with an IP %s after creation in vSphere, recreate it for a new key", acceptTimeout))
 			return ctrl.Result{}, nil
 		}
 		if !running || primaryIP == "" {
@@ -364,8 +365,8 @@ func (r *VirtualMachineReconciler) runAcceptKey(
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
-	elapsed := time.Since(vm.GetCreationTimestamp().Time)
-	if elapsed < acceptTimeout {
+	elapsed, created := sinceVSphereCreate(vm)
+	if !created || elapsed < acceptTimeout {
 		log.Info("No matching pending key yet, requeueing",
 			"name", vm.GetName(), "elapsed", elapsed.Round(time.Second), "timeout", acceptTimeout)
 		return ctrl.Result{RequeueAfter: requeueAfter}, nil
@@ -665,6 +666,23 @@ func guestSignalled(vm *unstructured.Unstructured) bool {
 		m, ok := c.(map[string]any)
 		return ok && m["type"] == vmConditionReady && m["status"] == "True"
 	})
+}
+
+func sinceVSphereCreate(vm *unstructured.Unstructured) (time.Duration, bool) {
+	conditions, _, _ := unstructured.NestedSlice(vm.Object, "status", "conditions")
+	for _, c := range conditions {
+		m, ok := c.(map[string]any)
+		if !ok || m["type"] != vmConditionCreated || m["status"] != "True" {
+			continue
+		}
+		ts, _ := m["lastTransitionTime"].(string)
+		createdAt, err := time.Parse(time.RFC3339, ts)
+		if err != nil {
+			return 0, false
+		}
+		return time.Since(createdAt), true
+	}
+	return 0, false
 }
 
 func (r *VirtualMachineReconciler) clearBootstrapKey(ctx context.Context, vm *unstructured.Unstructured) error {
@@ -1261,6 +1279,7 @@ const (
 	vmConversionAnnotation    = "vmoperator.vmware.com/conversion"
 	vmBackupCondition         = "VirtualMachineBackupUpToDate"
 	vmConditionReady          = "Ready"
+	vmConditionCreated        = "VirtualMachineCreated"
 )
 
 func (r *VirtualMachineReconciler) saltKeyConfigToVMs(ctx context.Context, obj client.Object) []reconcile.Request {

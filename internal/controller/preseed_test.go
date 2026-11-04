@@ -6,6 +6,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -62,9 +63,23 @@ func setGuestProbe(ctx context.Context, key types.NamespacedName, guestInfoKey s
 
 func setReadyCondition(ctx context.Context, key types.NamespacedName, status string) {
 	GinkgoHelper()
+	setCondition(ctx, key, map[string]any{"type": "Ready", "status": status})
+}
+
+func setCreatedCondition(ctx context.Context, key types.NamespacedName) {
+	GinkgoHelper()
+	setCondition(ctx, key, createdCondition())
+}
+
+func setCondition(ctx context.Context, key types.NamespacedName, cond map[string]any) {
+	GinkgoHelper()
 	vm := getVM(ctx, key)
-	Expect(unstructured.SetNestedSlice(vm.Object, []any{map[string]any{"type": "Ready", "status": status}},
-		"status", "conditions")).To(Succeed())
+	conds, _, _ := unstructured.NestedSlice(vm.Object, "status", "conditions")
+	conds = slices.DeleteFunc(conds, func(c any) bool {
+		m, ok := c.(map[string]any)
+		return ok && m["type"] == cond["type"]
+	})
+	Expect(unstructured.SetNestedSlice(vm.Object, append(conds, cond), "status", "conditions")).To(Succeed())
 	Expect(k8sClient.Status().Update(ctx, vm)).To(Succeed())
 }
 
@@ -489,9 +504,27 @@ var _ = Describe("Preseed key acceptance", func() {
 		Expect(drainEvents(reconciler)).NotTo(ContainElement(ContainSubstring("SaltKeyCleared")))
 	})
 
+	It("should keep the private key of a preseeded VM not yet created in vSphere past acceptTimeout", func() {
+		setAcceptTimeout(ctx, ns, "1ms")
+		preseededVM()
+		time.Sleep(10 * time.Millisecond)
+
+		result, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		secret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, secretKey, secret)).To(Succeed())
+		Expect(string(secret.Data["minion.pem"])).To(Equal("priv-" + vmName))
+		updated := getVM(ctx, req.NamespacedName)
+		Expect(updated.GetAnnotations()).NotTo(HaveKey(AnnotationKeyCleared))
+		Expect(updated.GetAnnotations()[AnnotationKeyStatus]).To(Equal(keyStatusPreseeded))
+		Expect(drainEvents(reconciler)).To(BeEmpty())
+	})
+
 	It("should clear the private key and fail a preseeded VM with no IP after acceptTimeout", func() {
 		setAcceptTimeout(ctx, ns, "1ms")
 		preseededVM()
+		setCreatedCondition(ctx, req.NamespacedName)
 
 		_, err := reconciler.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())

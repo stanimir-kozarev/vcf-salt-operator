@@ -45,10 +45,11 @@ type SaltKeyConfigSpec struct {
 	// +kubebuilder:default=discovery
 	KeyAcceptance string `json:"keyAcceptance,omitempty"`
 
-	// acceptTimeout is the maximum time, counted from VM creation, to wait for a Salt
-	// minion key to appear in the pending list. In preseed it bounds how long the private
-	// key stays in the bootstrap Secret: once it passes, the key is cleared, and a VM not yet
-	// running with an IP is marked Failed. Defaults to "10m".
+	// acceptTimeout is the maximum time, counted from the VM's creation in vSphere (its
+	// VirtualMachineCreated condition), to wait for a Salt minion key to appear in the
+	// pending list. In preseed it bounds how long the private key stays in the bootstrap
+	// Secret: once it passes, the key is cleared, and a VM not yet running with an IP is
+	// marked Failed. A VM not yet created in vSphere waits without a limit. Defaults to "10m".
 	// +optional
 	// +kubebuilder:default="10m"
 	AcceptTimeout string `json:"acceptTimeout,omitempty"`

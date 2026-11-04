@@ -16,7 +16,7 @@ Version history is in [CHANGELOG.md](CHANGELOG.md).
 
 | Platform | Installed as | Status |
 |---|---|---|
-| VCF 9.1.1 | [VCF Service](#deploy-as-a-vcf-service-vcf-91), from VCF Automation | Tested in 0.5.0, including in-place upgrade, key accept, preseeded keys, early key clear, highstate and key deletion |
+| VCF 9.1.1 | [VCF Service](#deploy-as-a-vcf-service-vcf-91), from VCF Automation | Tested in 0.5.0 and 0.5.1, including in-place upgrade, fresh install, key accept, preseeded keys, early key clear, highstate and key deletion |
 | VCF 9.1.1 | [Supervisor Service](#deploy-as-a-vcf9-supervisor-service), from vCenter | Expected to work, not tested |
 | VCF 9.1.0 | VCF Service, from VCF Automation | Tested with 0.4.0 release candidates, including in-place upgrades and Day-2 runs |
 | VCF 9.1.0 | Supervisor Service, from vCenter | Tested with 0.4.0 release candidates |
@@ -44,7 +44,8 @@ cluster-wide. For each VM annotated `salt.vcf.io/managed=true` it:
 4. Adds a Kubernetes finalizer (`salt.vcf.io/cleanup`) so key deletion runs before
    the VM object is garbage-collected.
 
-If no pending key appears within `acceptTimeout` (default `10m`) the VM is marked
+If no pending key appears within `acceptTimeout` (default `10m`), counted from the VM's
+creation in vSphere, the VM is marked
 `salt.vcf.io/key-status=Failed`, with one `SaltKeyTimeout` event, and the operator stops
 polling. The VM is not given up on: whenever it is reconciled again, for example after an
 operator restart, a VM update or a `salt.vcf.io/retry-request`, a matching pending key is
@@ -205,7 +206,8 @@ in that namespace. It follows Salt's preseed practice instead:
    the VM `salt.vcf.io/key-cleared=true`, once, on whichever comes first:
    - the guest's signal that the files are written (see below),
    - the first successful `test.ping`,
-   - `acceptTimeout` after VM creation, or a final ping failure. A VM still not running
+   - `acceptTimeout` after the VM's creation in vSphere, or a final ping failure. A VM
+     not yet created in vSphere waits without a limit. A VM still not running
      with an IP by then is marked `key-status=Failed` with event `SaltKeyTimeout` and must
      be recreated, which gives it a new key.
 
@@ -281,8 +283,8 @@ VM Operator delivers the rendered cloud-init data, Secret content included, to t
 as `guestinfo.userdata`, which any process in the guest can read through VMware Tools and
 any vCenter user with a permission on the VM, the `Read-only` role included, can read in
 its advanced settings or through the API. Step 5 limits that exposure of the private
-key to the time from VM creation to the guest signal or the first `test.ping`, and to
-`acceptTimeout` at most.
+key to the time from the VM's creation in vSphere to the guest signal or the first
+`test.ping`, and to `acceptTimeout` at most.
 
 The minion trusts only the master key in `minion_master.pub`. If the master's key changes,
 preseeded minions refuse it until that file is replaced on each of them. Masters that share
