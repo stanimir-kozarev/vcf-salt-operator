@@ -8,6 +8,19 @@ Entries are named after the feature they introduced, using the same names the
 [README](README.md) uses for its sections, so a capability can be traced from how it
 works to when it shipped.
 
+## Unreleased
+
+### Fixed
+
+- **The VCF Service install form configures the service.** Values entered in the VCF
+  Automation install form, in its fields or its YAML view, never reached the service, and
+  the Service Manager API was the only way to set them. VCF Automation passes the form input
+  under `values`, which the service package did not read. It now reads each region's
+  configuration there first, then where the API user overwrite puts it, so the API keeps
+  working for CI/CD pipelines and other automation. The upgrade and Edit forms open with the
+  installed values, so an upgrade through the form keeps the operator's connection and its
+  enrolled `SaltKeyConfig`s throughout.
+
 ## v0.5.1 - 2026-11-04
 
 Tested on VCF 9.1.1 as a VCF Service, fresh install. See [Platform support](README.md#platform-support).

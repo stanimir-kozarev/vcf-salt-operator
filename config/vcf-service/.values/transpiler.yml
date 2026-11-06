@@ -22,8 +22,8 @@
 #@   "scavengerExcludeMinions": "",
 #@ }
 
-#@ def entered(name):
-#@   for region in getattr(data.values, "regions", []):
+#@ def find_configuration(regions, name):
+#@   for region in regions:
 #@     if region.name == name:
 #@       return getattr(region, "configuration", None)
 #@     end
@@ -31,10 +31,21 @@
 #@   return None
 #@ end
 
+#@ def form_regions():
+#@   form = getattr(data.values, "values", None)
+#@   if form == None:
+#@     return []
+#@   end
+#@   return getattr(form, "regions", [])
+#@ end
+
 #@ def configuration(region):
-#@   given = getattr(region, "configuration", None)
+#@   given = find_configuration(form_regions(), region.name)
 #@   if given == None:
-#@     given = entered(region.name)
+#@     given = getattr(region, "configuration", None)
+#@   end
+#@   if given == None:
+#@     given = find_configuration(getattr(data.values, "regions", []), region.name)
 #@   end
 #@   result = {}
 #@   for key in DEFAULTS:

@@ -41,6 +41,11 @@ printf 'inventory:\n  regions:\n  - name: r1\n    supervisors:\n    - name: s1\n
 ytt -f "$TRANSPILER" --data-values-file "$OUT/inv-bare.yml" > "$OUT/form-bare.yaml"
 ytt -f "$TRANSPILER" --data-values-file "$OUT/inv-nested.yml" > "$OUT/form-nested.yaml"
 ytt -f "$TRANSPILER" --data-values-file config/vcf-service/.values/render.yml > "$OUT/form-entered.yaml"
+FORM='values:\n  regions:\n  - name: r1\n    supervisors:\n    - s1\n    configuration:\n      raasMasterID: from-form\n      enrolKeyAcceptance: preseed\n'
+printf "regions:\n- name: r1\n  supervisors:\n  - name: s1\n$FORM" > "$OUT/form-values-inv.yml"
+printf "regions:\n- name: r1\n  supervisors:\n  - s1\n$FORM" > "$OUT/form-values-tpl.yml"
+ytt -f "$TRANSPILER" --data-values-file "$OUT/form-values-inv.yml" > "$OUT/form-values.yaml"
+ytt -f config/vcf-service/config --data-values-file "$OUT/form-values-tpl.yml" -f dist/deps.yml > "$OUT/vcfservice-form.yaml"
 
 python3 - "$OUT" <<'PY'
 import sys, yaml, os
@@ -120,5 +125,11 @@ for shape in ("bare", "nested"):
 entered = yaml.safe_load(open("config/vcf-service/.values/render.yml"))["regions"][0]["configuration"]
 kept = load("form-entered.yaml")[0]["regions"][0]["configuration"]
 check(kept == entered, "install form: the values the provider entered are kept")
+typed = load("form-values.yaml")[0]["regions"][0]["configuration"]
+check(typed["raasMasterID"] == "from-form" and typed["enrolKeyAcceptance"] == "preseed",
+      "install form: values typed into the form under data.values.values are kept")
+sent = yaml.safe_load(find(load("vcfservice-form.yaml"), "Secret")[0]["stringData"]["values"])
+check(sent["raas"]["connection"]["masterID"] == "from-form" and sent["enrolment"]["keyAcceptance"] == "preseed",
+      "VCF Service: values typed into the form reach the Supervisor values Secret")
 sys.exit(1 if fails else 0)
 PY

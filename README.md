@@ -659,9 +659,12 @@ What differs from the Supervisor Service:
 - The bundle is unsigned, so VCF Automation shows a warning on upload. VCF 9.1 refuses an
   unsigned service's cluster-wide Secret reads, so every namespace uses the default
   connection and `rbac.tenantCredentialSecrets` is false.
-- On VCF Automation 9.1.0 and 9.1.1 the install form does not pass its values to the
-  service. Set the install values through the Service Manager API, and send them again to
-  each new version after an upgrade, since values are stored per version.
+- Enter the install values in the VCF Automation install form. For CI/CD pipelines and
+  other automation, send the same values through the Service Manager API as the user
+  overwrite. The upgrade and Edit forms open with the installed values. A pipeline that
+  upgrades through the API sends the values to the new version right away, since each
+  version stores its own. Until then the operator runs without them and removes the
+  `SaltKeyConfig`s it enrolled.
 - The Supervisor Service and the VCF Service share a service ID. Moving from one to the
   other means uninstalling and deleting the Supervisor Service first, which deletes every
   `SaltKeyConfig`. Re-apply enrolment from Git afterwards, or use automatic enrolment.

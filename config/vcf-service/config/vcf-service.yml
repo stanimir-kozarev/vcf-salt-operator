@@ -1,8 +1,24 @@
 #@ load("@ytt:data", "data")
 #@ load("@ytt:yaml", "yaml")
 
+#@ def form_configuration(name):
+#@   form = getattr(data.values, "values", None)
+#@   if form == None:
+#@     return None
+#@   end
+#@   for region in getattr(form, "regions", []):
+#@     if region.name == name:
+#@       return getattr(region, "configuration", None)
+#@     end
+#@   end
+#@   return None
+#@ end
+
 #@ def cfg(region, key, default):
-#@   c = getattr(region, "configuration", None)
+#@   c = form_configuration(region.name)
+#@   if c == None:
+#@     c = getattr(region, "configuration", None)
+#@   end
 #@   if c == None:
 #@     return default
 #@   end

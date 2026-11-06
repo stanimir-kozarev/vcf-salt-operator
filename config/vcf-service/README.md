@@ -144,11 +144,11 @@ Git afterwards, or set `enrolNamespaces`.
    take its service ID.
 2. VCF Automation, Provider Management, Service Management, Partner Services: upload
    `vcf-salt-operator.salt.vcf.io-<version>.tar`, accept the unsigned warning, activate.
-3. Install on the region and Supervisor. The install form shows the fields with
-   their defaults. On VCF Automation 9.1.0 and 9.1.1 the values entered there, and in Edit
-   later, do not reach the service, so the operator installs with no connection. Set them
-   through the API in step 4.
-4. Set the install values as the user overwrite, the YAML of the form, base64-encoded:
+3. Install on the region and Supervisor, and enter the install values in the form, in its
+   fields or in its YAML view. They reach the service as its values, and `raas-connection`
+   appears in the service namespace within a few minutes.
+4. For CI/CD pipelines and other automation, set the same values through the Service
+   Manager API as the user overwrite, the YAML of the form, base64-encoded:
 
    ```bash
    VCFA=<vcf-automation-fqdn>
@@ -178,15 +178,24 @@ Git afterwards, or set `enrolNamespaces`.
    Supervisor Service install drop `spec.credentialsSecret`, since this mode reads no
    Secret in tenant namespaces.
 
-An upgrade is a new version uploaded the same way and moved to from the installed
-service, or `PATCH /v2/vcf-services/{id}` with the new source. Each version is its own
-service entry with its own URN, and the user overwrite is stored on the entry, so the
-upgraded service installs with no values: `raas-connection` is removed and the
-`SaltKeyConfig`s turn `Ready=False`. Send the step 4 `PATCH` to the new version's URN. The
-upgrade form shows empty defaults just as Edit does. The `SaltKeyConfig`s turn `Ready`
-again within 30 seconds of `raas-connection` returning. Changing enrolment is a new user
-overwrite. Turning it off removes the `SaltKeyConfig`s
-the operator created and leaves the teams' own.
+An upgrade is a new version uploaded the same way and moved to from the installed service.
+The upgrade form opens with the installed values. Submit it unchanged, or change what you
+need, and the new version gets the values: the operator keeps its connection and its
+enrolled `SaltKeyConfig`s throughout. To change values later, use Edit. It opens with the
+current values and applies only what you change. A CI/CD pipeline upgrades with `PATCH
+/v2/vcf-services/{id}` and the new source. Each version is its own service entry with its
+own URN and the user overwrite is stored on the entry, so the new entry starts with no
+values. Send the step 4 `PATCH` to its URN as soon as the entry is listed. Until the
+values arrive the operator runs with enrolment off and no connection: it removes the
+`SaltKeyConfig`s it created, `raas-connection` is removed, the teams' own `SaltKeyConfig`s
+turn `Ready=False`, no new VM in those namespaces gets a key, and a deleted VM waits in
+`Terminating` until its key is deleted. The operator recreates the enrolled
+`SaltKeyConfig`s within a minute of the values arriving, and the teams' own turn `Ready`
+again within 30 seconds of `raas-connection` returning. Changing enrolment is a change of
+values, through Edit or a new user overwrite. Turning it off removes the `SaltKeyConfig`s
+the operator created and leaves the teams' own. VCF Automation leaves the values Secret of
+an uninstalled version, `vcf-salt-operator.salt.vcf.io-<version>-config-secret-*` in
+`vmware-system-supervisor-services` on the Supervisor, and it holds the RaaS password.
 
 ## Assumptions, as measured on VCF 9.1.0
 
@@ -197,6 +206,6 @@ the operator created and leaves the teams' own.
 | A3 | The platform runs the payload in its generated `svc-*` namespace and the Role and RoleBinding follow the Deployment there | Holds, 2026-10-19 |
 | A4 | A `SupervisorService` without overlay labels installs directly | Holds, 2026-10-19. `Healthy` on the `vcf-salt-operator-ready` ConfigMap |
 | A5 | The VCF Service may reuse the service ID `vcf-salt-operator.salt.vcf.io` once the Supervisor Service is deleted | Holds, 2026-10-19 |
-| A6 | A `format: password` value is passed through the values Secret | Holds through the API user overwrite, 2026-10-19. The install form sends no values at all |
+| A6 | A `format: password` value is passed through the values Secret | Holds through the API user overwrite, 2026-10-19, and through the install form on VCF 9.1.1, 2026-11-06 |
 | A7 | Namespace labels can be set on Supervisor namespaces for `enrolNamespaceSelector` | Not measured. Use `enrolNamespaces` by name |
 | A8 | Listing namespaces cluster-wide is allowed for an unsigned service | Holds, 2026-09-01, by the `vcf-hello-service` probe |
