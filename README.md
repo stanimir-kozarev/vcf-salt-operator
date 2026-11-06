@@ -16,7 +16,7 @@ Version history is in [CHANGELOG.md](CHANGELOG.md).
 
 | Platform | Installed as | Status |
 |---|---|---|
-| VCF 9.1.1 | [VCF Service](#deploy-as-a-vcf-service-vcf-91), from VCF Automation | Tested in 0.5.0 and 0.5.1, including in-place upgrade, fresh install, key accept, preseeded keys, early key clear, highstate and key deletion |
+| VCF 9.1.1 | [VCF Service](#deploy-as-a-vcf-service-vcf-91), from VCF Automation | Tested in 0.5.0, 0.5.1 and 0.5.2, including in-place upgrade, fresh install, the install, upgrade and Edit forms, key accept, preseeded keys, early key clear, highstate and key deletion |
 | VCF 9.1.1 | [Supervisor Service](#deploy-as-a-vcf9-supervisor-service), from vCenter | Expected to work, not tested |
 | VCF 9.1.0 | VCF Service, from VCF Automation | Tested with 0.4.0 release candidates, including in-place upgrades and Day-2 runs |
 | VCF 9.1.0 | Supervisor Service, from vCenter | Tested with 0.4.0 release candidates |

@@ -8,7 +8,10 @@ Entries are named after the feature they introduced, using the same names the
 [README](README.md) uses for its sections, so a capability can be traced from how it
 works to when it shipped.
 
-## Unreleased
+## v0.5.2 - 2026-11-06
+
+Tested on VCF 9.1.1 as a VCF Service, installed, upgraded and edited through the VCF
+Automation forms. See [Platform support](README.md#platform-support).
 
 ### Fixed
 
